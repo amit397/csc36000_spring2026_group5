@@ -167,9 +167,50 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
-            per_node_results.append(f.result())
+        future_map = {}
+
+        # Submit initial tasks
+        for node, sl in zip(nodes_sorted, slices):
+            fut = ex.submit(call_node, node, sl)
+            future_map[fut] = {
+                "slice": sl,
+                "attempted_nodes": {node["node_id"]}
+            }
+
+        while future_map:
+            for f in as_completed(list(future_map.keys())):
+                meta = future_map.pop(f)
+                sl = meta["slice"]
+                attempted = meta["attempted_nodes"]
+
+                try:
+                    result = f.result()
+                    per_node_results.append(result)
+
+                except Exception as e:
+                    print(f"[primary] Node failed for slice {sl}: {e}")
+
+                    # Find another node not yet tried
+                    remaining_nodes = [
+                        n for n in nodes_sorted
+                        if n["node_id"] not in attempted
+                    ]
+
+                    if not remaining_nodes:
+                        raise RuntimeError(
+                            f"All nodes failed for slice {sl}"
+                        )
+
+                    new_node = remaining_nodes[0]
+                    print(f"[primary] Redirecting slice {sl} to node {new_node['node_id']}")
+
+                    new_future = ex.submit(call_node, new_node, sl)
+                    future_map[new_future] = {
+                        "slice": sl,
+                        "attempted_nodes": attempted | {new_node["node_id"]}
+                    }
+
+                break  # break so as_completed restarts with updated futures
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
