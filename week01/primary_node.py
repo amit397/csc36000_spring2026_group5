@@ -51,10 +51,27 @@ class Registry:
             self.nodes[node_id] = record
             return record
 
+
+    def ping(self, host: str, port: int) -> bool:
+        try:
+            url = f"http://{host}:{port}/health"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data.get("ok", False)
+        except Exception:
+            return False
+    
     def active_nodes(self) -> List[Dict[str, Any]]:
         now = time.time()
         with self.lock:
             stale = [nid for nid, rec in self.nodes.items() if (now - float(rec.get("last_seen", 0))) > self.ttl_s]
+            
+            for nid in list(self.nodes.keys()):
+                print("CHECKING NODE:", self.nodes[nid])
+                if not (self.ping(self.nodes[nid]["host"], self.nodes[nid]["port"])):
+                    print("NODE IS STALE/UNREACHABLE:", self.nodes[nid])
+                    stale.append(nid)
+                else: print("NODE IS ACTIVE:", self.nodes[nid])
             for nid in stale:
                 del self.nodes[nid]
             return list(self.nodes.values())
@@ -89,6 +106,14 @@ def split_into_slices(low: int, high: int, n: int) -> List[Tuple[int, int]]:
 
 
 def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = REGISTRY.active_nodes()
+    if not nodes:
+        return {
+            "ok": False,
+            "error": "No secondary nodes available. Please start at least one worker.",
+            "status_code": 503 # Service Unavailable
+        }
+
     low = int(payload["low"])
     high = int(payload["high"])
     if high <= low:
@@ -208,7 +233,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     if mode == "list":
         resp["primes"] = primes_sample
         resp["primes_truncated"] = primes_truncated
-        resp["max_return_primes"] = max_return_primes
+        resp["max_return_primes"] = max_return_primesf
 
     if include_per_node:
         resp["per_node"] = per_node_results
