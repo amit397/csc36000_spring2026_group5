@@ -108,55 +108,94 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     max_return_primes = int(payload.get("max_return_primes", 5000))
     include_per_node = bool(payload.get("include_per_node", False))
+    chunk_size = int(payload.get("chunk", 500_000))
 
-    nodes = REGISTRY.active_nodes()
-    if not nodes:
-        raise ValueError("no active secondary nodes registered")
+    # Initial node snapshot to determine slicing
+    # We want to slice based on currently available capacity, 
+    # but the execution will adapt if nodes drop out.
+    initial_nodes = REGISTRY.active_nodes()
+    if not initial_nodes:
+        # If no nodes initially, we might want to wait or fail. 
+        # The prompt implies we should be robust.
+        # But for 'slicing', we need a number. Let's wait for at least one node.
+        print("[primary] No nodes available at start. Waiting for nodes...")
+        while not initial_nodes:
+            time.sleep(1)
+            initial_nodes = REGISTRY.active_nodes()
+        print(f"[primary] Found {len(initial_nodes)} nodes to start.")
+
+    # Sort for deterministic slicing
+    initial_nodes_sorted = sorted(initial_nodes, key=lambda n: n["node_id"])
     
-    chunk = int(payload.get("chunk", 500_000))
-
-    nodes_sorted = sorted(nodes, key=lambda n: n["node_id"])
-    slices = split_into_slices(low, high, len(nodes_sorted))
-    nodes_sorted = nodes_sorted[:len(slices)]
-
+    # We create slices based on the initial view. 
+    # If nodes die, the remaining nodes will iterate through these slices.
+    slices = split_into_slices(low, high, len(initial_nodes_sorted))
+    
     t0 = time.perf_counter()
 
+    # Track results
     per_node_results: List[Dict[str, Any]] = []
-    total_primes = 0
-    primes_sample: List[int] = []
-    primes_truncated = False
-    max_prime = -1
+    
+    # Work queue: which slices still need to be computed
+    # We store (slice_start, slice_end) tuples
+    pending_slices = slices.copy() 
+    
+    # Failed nodes tracking: node_id -> timestamp_when_failed
+    # We will ignore failed nodes until their 'last_seen' in registry > timestamp_when_failed
+    failed_nodes: Dict[str, float] = {}
 
-    def call_node(node: Dict[str, Any], sl: Tuple[int, int]) -> Dict[str, Any]:
+    def get_candidates() -> List[Dict[str, Any]]:
+        """
+        Returns list of healthy nodes.
+        Checks registry and filters out known failed nodes 
+        unless they have re-registered (updated last_seen).
+        """
+        current = REGISTRY.active_nodes()
+        healthy = []
+        for n in current:
+            nid = n["node_id"]
+            if nid in failed_nodes:
+                # Check if it has recovered (new heartbeat since failure)
+                if float(n.get("last_seen", 0)) > failed_nodes[nid]:
+                    del failed_nodes[nid]
+                    healthy.append(n)
+                else:
+                    # Still stale/dead
+                    pass
+            else:
+                healthy.append(n)
+        return healthy
+
+    def process_slice(start: int, end: int, node: Dict[str, Any]) -> Dict[str, Any]:
+        """Calls the secondary node for a specific slice."""
         host = node["host"]
         port = node["port"]
         url = f"http://{host}:{port}/compute"
         req = {
-            "low": sl[0],
-            "high": sl[1],
+            "low": start,
+            "high": end,
             "mode": mode,
-            "chunk": chunk,
+            "chunk": chunk_size,
             "exec": sec_exec,
             "workers": sec_workers,
             "max_return_primes": max_return_primes if mode == "list" else 0,
             "include_per_chunk": False,
         }
+        # filter None
         req = {k: v for k, v in req.items() if v is not None}
 
         t_call0 = time.perf_counter()
-        resp = _post_json(url, req, timeout_s=3600)
+        resp = _post_json(url, req, timeout_s=3600) 
         t_call1 = time.perf_counter()
 
         if not resp.get("ok"):
-            raise RuntimeError(f"node {node['node_id']} error: {resp}")
+            raise RuntimeError(f"node {node['node_id']} returned error: {resp}")
         
         node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
-        print(f"Node ID: {node["node_id"]} completed in: {node_elapsed_s}")
-
         return {
             "node_id": node["node_id"],
             "node": {"host": host, "port": port, "cpu_count": node.get("cpu_count", 1)},
-            "slice": list(sl),
+            "slice": (start, end),
             "round_trip_s": t_call1 - t_call0,
             "node_elapsed_s": node_elapsed_s,
             "node_sum_chunk_s": float(resp.get("sum_chunk_compute_seconds", 0.0)),
@@ -166,12 +205,90 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
 
-    with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
-            per_node_results.append(f.result())
+    # Main execution loop
+    # We use a ThreadPoolExecutor, but we manage submissions dynamically
+    # to handle retries and node availability.
+    
+    # We'll use a larger pool to accommodate checking/waiting logic if needed,
+    # but realistically we limit concurrency to the number of slices or nodes.
+    max_concurrent = 32
+    
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        # Map: Future -> (slice_start, slice_end, assigned_node_id)
+        future_to_work: Dict[Any, Tuple[int, int, str]] = {}
+        
+        # While there is work to do (pending or in-flight)
+        while pending_slices or future_to_work:
+            
+            # 1. Fill available slots with pending work
+            # Only submit if we have pending slices and we aren't saturating everyone
+            # Ideally we want 1 task per healthy node.
+            
+            candidates = get_candidates()
+            
+            # If no nodes are available at all, we must wait.
+            if not candidates and not future_to_work:
+                print("[primary] No active healthy nodes! Waiting for nodes to recover/register...")
+                time.sleep(2)
+                continue
 
+            # Identify nodes that are currently busy
+            busy_nodes = {assigned_nid for (_, _, assigned_nid) in future_to_work.values()}
+            
+            # Helper to find a free node
+            free_nodes = [n for n in candidates if n["node_id"] not in busy_nodes]
+            
+            # If we have pending tasks and free nodes, submit them
+            while pending_slices and free_nodes:
+                sl = pending_slices.pop(0) # Get next slice
+                node = free_nodes.pop(0)   # Get a free node
+                
+                print(f"[primary] Assigning slice {sl} to node {node['node_id']}")
+                fut = executor.submit(process_slice, sl[0], sl[1], node)
+                future_to_work[fut] = (sl[0], sl[1], node["node_id"])
+
+            # 2. Wait for at least one future to complete (or for nodes to become available if we are stuck)
+            # If we have futures running, check them.
+            if future_to_work:
+                # We use a short timeout so we can periodically check pending_slices/free_nodes
+                # in case a new node appeared (though strictly we only care if we have pending work).
+                # But more importantly, we assume wait() returns fast if things finish.
+                done, not_done = as_completed(future_to_work.keys(), timeout=1.0), [] 
+                
+                # Check actual done list (as_completed yields iterator)
+                # But wait... as_completed is an iterator. We can't use it nicely with a timeout in a loop 
+                # effectively unless we break.
+                # Use executor.submit and manual check? or just `wait()`
+                from concurrent.futures import wait, FIRST_COMPLETED
+                done_futures, not_done_futures = wait(future_to_work.keys(), timeout=1.0, return_when=FIRST_COMPLETED)
+                
+                for f in done_futures:
+                    sl_start, sl_end, assigned_nid = future_to_work.pop(f)
+                    try:
+                        result = f.result()
+                        per_node_results.append(result)
+                        print(f"[primary] Slice {(sl_start, sl_end)} completed by {assigned_nid}")
+                    except Exception as e:
+                        print(f"[primary] Error on node {assigned_nid} for slice {(sl_start, sl_end)}: {e}")
+                        # Mark failed
+                        failed_nodes[assigned_nid] = time.time()
+                        # Re-queue the work
+                        print(f"[primary] Re-queuing slice {(sl_start, sl_end)}")
+                        pending_slices.append((sl_start, sl_end))
+            else:
+                 # No futures running, but maybe we have pending slices (and no free nodes caught in loop above)
+                 # just sleep a bit to avoid hot loop if waiting for nodes
+                 if pending_slices:
+                     time.sleep(1)
+
+
+    # Aggregation (same as before)
     per_node_results.sort(key=lambda r: r["slice"][0])
+    
+    total_primes = 0
+    max_prime = -1
+    primes_sample: List[int] = []
+    primes_truncated = False
 
     for r in per_node_results:
         total_primes += int(r["total_primes"])
@@ -194,10 +311,10 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ok": True,
         "mode": mode,
         "range": [low, high],
-        "nodes_used": len(nodes_sorted),
+        "nodes_used": len(initial_nodes_sorted), # count of initial plan
         "secondary_exec": sec_exec,
         "secondary_workers": sec_workers,
-        "chunk": chunk,
+        "chunk": chunk_size,
         "total_primes": total_primes,
         "max_prime": max_prime,
         "elapsed_seconds": t1 - t0,
