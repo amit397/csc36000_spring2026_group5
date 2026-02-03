@@ -169,7 +169,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
         future_map = {}
 
-        # Submit initial tasks
+        # Send the slices to our nodes
         for node, sl in zip(nodes_sorted, slices):
             fut = ex.submit(call_node, node, sl)
             future_map[fut] = {
@@ -178,6 +178,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         while future_map:
+            # Get the results
             for f in as_completed(list(future_map.keys())):
                 meta = future_map.pop(f)
                 sl = meta["slice"]
@@ -190,7 +191,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception as e:
                     print(f"[primary] Node failed for slice {sl}: {e}")
 
-                    # Find another node not yet tried
+                    # Find another node not yet tried and redirect to another node
                     remaining_nodes = [
                         n for n in nodes_sorted
                         if n["node_id"] not in attempted
@@ -210,7 +211,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "attempted_nodes": attempted | {new_node["node_id"]}
                     }
 
-                break  # break so as_completed restarts with updated futures
+                break  # break so as_completed can restart with updated futures
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
