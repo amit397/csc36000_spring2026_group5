@@ -59,6 +59,16 @@ class Registry:
                 del self.nodes[nid]
             return list(self.nodes.values())
 
+    def mark_node_failed(self, node_id: str) -> None:
+        """
+        Remove a failed node from the registry.
+        This prevents assigning new work to a node that has crashed.
+        """
+        with self.lock:
+            if node_id in self.nodes:
+                del self.nodes[node_id]
+                print(f"[primary_node] Node {node_id} removed from registry (failed)")
+
 
 REGISTRY = Registry(ttl_s=120)
 
@@ -89,6 +99,8 @@ def split_into_slices(low: int, high: int, n: int) -> List[Tuple[int, int]]:
 
 
 def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
+    TIMEOUT_SECONDS = 60  # Failure detection: if node doesn't respond in 60s, assume it failed
+
     low = int(payload["low"])
     high = int(payload["high"])
     if high <= low:
@@ -122,6 +134,8 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.perf_counter()
 
     per_node_results: List[Dict[str, Any]] = []
+    failed_nodes: set = set()                  # Track which nodes failed
+    failed_slices: List[Tuple[int, int]] = []  # Track slices that need retry
     total_primes = 0
     primes_sample: List[int] = []
     primes_truncated = False
@@ -144,7 +158,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         req = {k: v for k, v in req.items() if v is not None}
 
         t_call0 = time.perf_counter()
-        resp = _post_json(url, req, timeout_s=3600)
+        resp = _post_json(url, req, timeout_s=TIMEOUT_SECONDS)
         t_call1 = time.perf_counter()
 
         if not resp.get("ok"):
@@ -166,10 +180,34 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
 
-    with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
-            per_node_results.append(f.result())
+    # STEP 1: Send work to all nodes in parallel
+    with ThreadPoolExecutor(max_workers=len(nodes_sorted)) as ex:
+        futures = {ex.submit(call_node, node, sl): (node, sl) for node, sl in zip(nodes_sorted, slices)}
+
+        for f in as_completed(futures):
+            node, sl = futures[f]
+            try:
+                result = f.result()
+                per_node_results.append(result)
+            except Exception as e:
+                print(f"[primary_node] Node {node['node_id']} FAILED: {e}")
+                failed_nodes.add(node["node_id"])
+                failed_slices.append(sl)
+                REGISTRY.mark_node_failed(node["node_id"])
+
+    # STEP 2: Retry failed slices on healthy nodes
+    for sl in failed_slices:
+        healthy_nodes = [n for n in REGISTRY.active_nodes() if n["node_id"] not in failed_nodes]
+
+        if not healthy_nodes:
+            raise RuntimeError(f"No healthy nodes to retry slice {sl}")
+
+        retry_node = healthy_nodes[0]
+        try:
+            result = call_node(retry_node, sl)
+            per_node_results.append(result)
+        except Exception as e:
+            raise RuntimeError(f"Retry failed for slice {sl}: {e}")
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
