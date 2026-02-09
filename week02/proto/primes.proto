@@ -1,0 +1,179 @@
+// primes.proto
+// Protocol Buffer schema for the distributed prime-number computation system.
+// This schema replaces the HTTP/JSON API with strongly-typed gRPC services.
+
+syntax = "proto3";
+
+package primes;
+
+// =============================================================================
+// ENUMS - Strongly typed (no strings)
+// =============================================================================
+
+// Computation mode: count primes or list them
+enum Mode {
+  COUNT = 0;
+  LIST = 1;
+}
+
+// Execution mode for worker parallelism
+enum ExecMode {
+  SINGLE = 0;
+  THREADS = 1;
+  PROCESSES = 2;
+}
+
+// =============================================================================
+// MESSAGES
+// =============================================================================
+
+// Node metadata for registration and tracking
+message NodeInfo {
+  string node_id = 1;
+  string host = 2;
+  int32 port = 3;
+  int32 cpu_count = 4;
+  double last_seen = 5;       // Unix timestamp
+  double registered_at = 6;   // Unix timestamp
+}
+
+// --- Registration ---
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string host = 2;
+  int32 port = 3;
+  int32 cpu_count = 4;
+  double timestamp = 5;       // Current time for heartbeat
+}
+
+message RegisterNodeResponse {
+  bool ok = 1;
+  NodeInfo node = 2;
+  string error = 3;
+}
+
+// --- List Nodes ---
+
+message ListNodesRequest {
+  // No parameters needed
+}
+
+message ListNodesResponse {
+  bool ok = 1;
+  repeated NodeInfo nodes = 2;
+  int32 ttl_seconds = 3;
+  string error = 4;
+}
+
+// --- Health Check ---
+
+message HealthRequest {
+  // No parameters needed
+}
+
+message HealthResponse {
+  bool ok = 1;
+  string status = 2;          // e.g., "healthy"
+  string node_id = 3;         // Optional: which node responded
+}
+
+// --- Per-Node Result (for aggregation) ---
+
+message PerNodeResult {
+  string node_id = 1;
+  string host = 2;
+  int32 port = 3;
+  int32 cpu_count = 4;
+  int64 slice_low = 5;
+  int64 slice_high = 6;
+  double round_trip_seconds = 7;
+  double node_elapsed_seconds = 8;
+  double sum_chunk_compute_seconds = 9;
+  int64 total_primes = 10;
+  int64 max_prime = 11;
+  repeated int64 primes = 12;
+  bool primes_truncated = 13;
+}
+
+// --- Compute Request/Response ---
+
+// Unified compute request used by both Coordinator.Compute and Worker.ComputeRange
+message ComputeRequest {
+  int64 low = 1;                          // Range start (inclusive)
+  int64 high = 2;                         // Range end (exclusive)
+  Mode mode = 3;                          // COUNT or LIST
+  int64 chunk = 4;                        // Chunk size for partitioning
+  ExecMode exec_mode = 5;                 // SINGLE, THREADS, or PROCESSES
+  int32 workers = 6;                      // Number of workers (0 = use cpu_count)
+  int32 max_return_primes = 7;            // Cap for list mode
+  bool include_per_node = 8;              // Include per-node breakdown (coordinator only)
+  bool include_per_chunk = 9;             // Include per-chunk breakdown (worker only)
+}
+
+// Compute response returned by both Coordinator and Worker
+message ComputeResponse {
+  bool ok = 1;
+  string error = 2;
+  
+  // Request echo
+  Mode mode = 3;
+  int64 range_low = 4;
+  int64 range_high = 5;
+  
+  // Results
+  int64 total_primes = 6;
+  int64 max_prime = 7;
+  repeated int64 primes = 8;              // Only populated in LIST mode
+  bool primes_truncated = 9;
+  int32 max_return_primes = 10;
+  
+  // Timing
+  double elapsed_seconds = 11;
+  double sum_chunk_compute_seconds = 12;  // Worker: sum of chunk times
+  double sum_node_compute_seconds = 13;   // Coordinator: sum of node times
+  double sum_node_round_trip_seconds = 14;
+  
+  // Execution info
+  ExecMode exec_mode = 15;                // Worker's exec mode
+  int32 workers = 16;                     // Number of workers used
+  int32 chunks = 17;                      // Number of chunks processed
+  int64 chunk_size = 18;                  // Chunk size used
+  int32 nodes_used = 19;                  // Coordinator: number of nodes
+  
+  // Per-node breakdown (coordinator only, when include_per_node=true)
+  repeated PerNodeResult per_node = 20;
+  
+  // Worker identification
+  string node_id = 21;
+}
+
+// =============================================================================
+// SERVICES
+// =============================================================================
+
+// CoordinatorService - Primary node (formerly primary_node.py HTTP endpoints)
+service CoordinatorService {
+  // Register a worker node with the coordinator
+  // Replaces: POST /register
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  
+  // List all active registered nodes
+  // Replaces: GET /nodes
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  
+  // Distribute prime computation across registered workers
+  // Replaces: POST /compute
+  rpc Compute(ComputeRequest) returns (ComputeResponse);
+}
+
+// WorkerService - Secondary node (formerly secondary_node.py HTTP endpoints)
+service WorkerService {
+  // Compute primes for a given range
+  // Replaces: POST /compute
+  rpc ComputeRange(ComputeRequest) returns (ComputeResponse);
+  
+  // Health check
+  // Replaces: GET /health
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
