@@ -25,11 +25,21 @@ python primary_node.py --host 127.0.0.1 --port 9300
 # Standalone (no coordinator)
 python secondary_node.py --port 9100
 
-# With coordinator registration
-python secondary_node.py --port 9100 --primary 127.0.0.1:9200
+# With coordinator registration 
+python secondary_node.py --port 9100 --primary 127.0.0.1:9300
+
+# With coordinator registration && node-id specified
+
+python secondary_node.py --port 9100 --primary 127.0.0.1:9300 --node-id worker1
+```
+### 5. Run primes_cli
+```powershell
+python primes_cli.py --exec distributed --primary 127.0.0.1:9300 --low 1 --high 5000000 --mode count --include-per-node --time
 ```
 
-### 5. Run Tests (Skip steps 3 and 4, do this alone)
+
+
+### 6. Run Tests (Skip steps 3, 4, 5 and do this alone)
 ```powershell
 
 # Run tests in powershell
