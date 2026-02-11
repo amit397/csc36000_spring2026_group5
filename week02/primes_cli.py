@@ -98,7 +98,7 @@ def main(argv: list[str]) -> int:
         # Convert mode string to protobuf enum
         mode_enum = primes_pb2.LIST if return_list else primes_pb2.COUNT
 
-        # Convert secondary_exec string → protobuf enum
+        # Convert secondary_exec string to protobuf enum
         if args.secondary_exec == "single":
             exec_enum = primes_pb2.SINGLE
         elif args.secondary_exec == "threads":
@@ -130,7 +130,7 @@ def main(argv: list[str]) -> int:
             print(f"Distributed error: {response.error}", file=sys.stderr)
             return 1
         
-        # Convert gRPC response → dict format expected by existing CLI logic
+        # Convert gRPC response to dict format expected by existing CLI logic
         resp = {
             "ok": response.ok,
             "mode": response.mode,
