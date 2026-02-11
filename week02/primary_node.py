@@ -2,31 +2,23 @@
 """
 primary_node.py
 
-Primary coordinator that:
-1) Maintains an in-memory registry of secondary nodes (registered by secondary_node.py)
-2) Distributes prime-range computation requests to registered secondary nodes
-3) Aggregates results in memory and returns a final result (count or list sample)
+gRPC Coordinator for distributed prime-number computation.
+Implements CoordinatorService: RegisterNode, ListNodes, Compute.
 
-Endpoints
----------
-GET  /health
-GET  /nodes
-POST /register
-POST /compute
+Replaces the HTTP-based primary node from week01.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import threading
 import time
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Tuple
-from urllib.parse import urlparse
 
+import grpc
+import primes_pb2_grpc
+import primes_pb2
 
 class Registry:
     def __init__(self, ttl_s: int = 3600):
@@ -59,16 +51,251 @@ class Registry:
                 del self.nodes[nid]
             return list(self.nodes.values())
 
+class CoordinatorServiceServicer(primes_pb2_grpc.CoordinatorServiceServicer):
+    def RegisterNode(self, request, context):   
+        #We need to get the fields from protofbuf 
+        node_data = {
+            "node_id": request.node_id,
+            "host": request.host,
+            "port": request.port,
+            "cpu_count" : request.cpu_count,
+            "ts" : request.timestamp
+        }
+        #Keep track of the node
+        record = REGISTRY.upsert(node_data)
+        print(f"[primary_node] Registered node: {request.node_id} at {request.host}:{request.port}")
+
+        return primes_pb2.RegisterNodeResponse(
+            ok=True, 
+            node=primes_pb2.NodeInfo(
+                node_id=record["node_id"],
+                host=record["host"],
+                port=record["port"],
+                cpu_count=record["cpu_count"],
+                last_seen=record["last_seen"],
+                registered_at=record["registered_at"]
+            ),
+            error=""
+        )
+
+    def ListNodes(self, request, context):
+        # Get active nodes (removes stale nodes based on TTL)
+        nodes = REGISTRY.active_nodes()
+
+        # Sort for consistent ordering
+        nodes.sort(key=lambda n: n["node_id"])
+
+        # Convert each dict to NodeInfo protobuf
+        node_infos = []
+        for n in nodes:
+            node_infos.append(primes_pb2.NodeInfo(
+                node_id=n["node_id"],
+                host=n["host"],
+                port=n["port"],
+                cpu_count=n["cpu_count"],
+                last_seen=n["last_seen"],
+                registered_at=n["registered_at"],
+            ))
+
+        return primes_pb2.ListNodesResponse(
+            ok=True,
+            nodes=node_infos,
+            ttl_seconds=REGISTRY.ttl_s,
+            error="",
+        )
+
+    def Compute(self, request, context):
+        compute_data = {
+            "low": request.low,
+            "high": request.high,
+            "mode": request.mode,
+            "chunk": request.chunk,
+            "exec_mode": request.exec_mode,
+            "workers": request.workers,
+            "max_return_primes": request.max_return_primes,
+            "include_per_node": request.include_per_node,
+            "include_per_chunk": request.include_per_chunk,
+        }
+
+        if request.high <= request.low:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("high must be > low")
+            return primes_pb2.ComputeResponse(ok=False, error="high must be > low")
+
+        nodes = REGISTRY.active_nodes()
+        if not nodes:
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            context.set_details("No nodes available")
+            return primes_pb2.ComputeResponse(ok=False, error="No nodes available")
+        
+        # Set default values for optional fields (0 means "not set")
+        chunk = request.chunk if request.chunk > 0 else 500_000
+        workers = request.workers if request.workers > 0 else 0  # 0 = worker uses cpu_count
+        max_return_primes = request.max_return_primes if request.max_return_primes > 0 else 5000
+
+        # Sort nodes for consistent ordering
+        nodes.sort(key=lambda n: n["node_id"])
+
+        # Split the range into slices (one per worker node)
+        slices = split_into_slices(request.low, request.high, len(nodes))
+
+        # Start timer
+        t0 = time.perf_counter()
+
+        # Helper function to call ONE worker via gRPC
+        def call_worker(node, slice_low, slice_high):
+            host = node["host"]
+            port = node["port"]
+            t_call0 = time.perf_counter()
+
+            # Create gRPC channel (connection) to the worker
+            channel = grpc.insecure_channel(f"{host}:{port}")
+
+            # Create a stub (client) to call the worker's methods
+            stub = primes_pb2_grpc.WorkerServiceStub(channel)
+
+            # Build the request to send to the worker
+            worker_request = primes_pb2.ComputeRequest(
+                low=slice_low,
+                high=slice_high,
+                mode=request.mode,
+                chunk=chunk,
+                exec_mode=request.exec_mode,
+                workers=workers,
+                max_return_primes=max_return_primes if request.mode == primes_pb2.LIST else 0,
+            )
+
+            # Call the worker's ComputeRange method (with 1 hour timeout)
+            response = stub.ComputeRange(worker_request, timeout=3600)
+
+            t_call1 = time.perf_counter()
+            channel.close()
+
+            # Return PerNodeResult protobuf directly
+            return primes_pb2.PerNodeResult(
+                node_id=node["node_id"],
+                host=host,
+                port=port,
+                cpu_count=node.get("cpu_count", 1),
+                slice_low=slice_low,
+                slice_high=slice_high,
+                round_trip_seconds=t_call1 - t_call0,
+                node_elapsed_seconds=response.elapsed_seconds,
+                sum_chunk_compute_seconds=response.sum_chunk_compute_seconds,
+                total_primes=response.total_primes,
+                max_prime=response.max_prime,
+                primes=list(response.primes),
+                primes_truncated=response.primes_truncated,
+            )
+
+        # Call all workers in parallel using ThreadPoolExecutor
+        per_node_results = []
+
+        with ThreadPoolExecutor(max_workers=len(nodes)) as executor:
+            # Submit a task for each node/slice pair
+            futures = []
+            for i, node in enumerate(nodes):
+                if i < len(slices):  # Make sure we have a slice for this node
+                    slice_low, slice_high = slices[i]
+                    print(f"[primary] Assigning slice ({slice_low}, {slice_high}) to {node['node_id']}")
+                    fut = executor.submit(call_worker, node, slice_low, slice_high)
+                    futures.append(fut)
+
+            # Collect results as they complete
+            for fut in futures:
+                try:
+                    result = fut.result()  # This is a PerNodeResult
+                    per_node_results.append(result)
+                    print(f"[primary] Slice ({result.slice_low}, {result.slice_high}) done by {result.node_id}")
+
+                except grpc.RpcError as e:
+                    # Convert gRPC errors to structured status/details
+                    # e.code() = status code (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+                    # e.details() = error message from the worker
+                    if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                        error_msg = f"Worker timed out: {e.details()}"
+                    elif e.code() == grpc.StatusCode.UNAVAILABLE:
+                        error_msg = f"Worker unavailable: {e.details()}"
+                    else:
+                        error_msg = f"Worker error: {e.code().name} - {e.details()}"
+
+                    print(f"[primary] {error_msg}")
+                    context.set_code(e.code())
+                    context.set_details(error_msg)
+                    return primes_pb2.ComputeResponse(ok=False, error=error_msg)
+
+                except Exception as e:
+                    # Non-gRPC error
+                    error_msg = f"Unexpected error: {str(e)}"
+                    print(f"[primary] {error_msg}")
+                    context.set_code(grpc.StatusCode.INTERNAL)
+                    context.set_details(error_msg)
+                    return primes_pb2.ComputeResponse(ok=False, error=error_msg)
+
+        # Sort results by slice_low so primes are in order
+        per_node_results.sort(key=lambda r: r.slice_low)
+
+        # Aggregate: sum counts, find max, merge primes
+        total_primes = 0
+        max_prime = -1
+        all_primes = []
+        primes_truncated = False
+
+        for r in per_node_results:
+            # Sum up prime counts from all workers
+            total_primes += r.total_primes
+
+            # Track the largest prime found
+            if r.max_prime > max_prime:
+                max_prime = r.max_prime
+
+            # For LIST mode: merge primes (with cap)
+            if request.mode == primes_pb2.LIST:
+                if len(all_primes) < max_return_primes:
+                    remaining = max_return_primes - len(all_primes)
+                    all_primes.extend(list(r.primes)[:remaining])
+                    if len(r.primes) > remaining:
+                        primes_truncated = True
+                else:
+                    primes_truncated = True
+
+                # If worker already truncated, we're truncated too
+                if r.primes_truncated:
+                    primes_truncated = True
+
+        # Stop timer
+        t1 = time.perf_counter()
+
+        # Build the final response
+        return primes_pb2.ComputeResponse(
+            ok=True,
+            error="",
+            # Echo back what was requested
+            mode=request.mode,
+            range_low=request.low,
+            range_high=request.high,
+            # Results
+            total_primes=total_primes,
+            max_prime=max_prime,
+            primes=all_primes if request.mode == primes_pb2.LIST else [],
+            primes_truncated=primes_truncated,
+            max_return_primes=max_return_primes,
+            # Timing
+            elapsed_seconds=t1 - t0,
+            sum_chunk_compute_seconds=sum(r.sum_chunk_compute_seconds for r in per_node_results),
+            sum_node_compute_seconds=sum(r.node_elapsed_seconds for r in per_node_results),
+            sum_node_round_trip_seconds=sum(r.round_trip_seconds for r in per_node_results),
+            # Execution info
+            exec_mode=request.exec_mode,
+            workers=workers,
+            chunks=len(slices),
+            chunk_size=chunk,
+            nodes_used=len(per_node_results),
+            # Per-node breakdown (only if requested)
+            per_node=per_node_results if request.include_per_node else [],
+        )
 
 REGISTRY = Registry(ttl_s=120)
-
-
-def _post_json(url: str, payload: Dict[str, Any], timeout_s: int = 60) -> Dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))
 
 
 def split_into_slices(low: int, high: int, n: int) -> List[Tuple[int, int]]:
@@ -88,312 +315,9 @@ def split_into_slices(low: int, high: int, n: int) -> List[Tuple[int, int]]:
     return out
 
 
-def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
-    low = int(payload["low"])
-    high = int(payload["high"])
-    if high <= low:
-        raise ValueError("high must be > low")
-
-    mode = str(payload.get("mode", "count"))
-    if mode not in ("count", "list"):
-        raise ValueError("mode must be 'count' or 'list'")
-    
-    sec_exec = str(payload.get("secondary_exec", "processes"))
-    if sec_exec not in ("single", "threads", "processes"):
-        raise ValueError("secondary_exec must be single|threads|processes")
-
-    sec_workers = payload.get("secondary_workers", None)
-    if sec_workers is not None:
-        sec_workers = int(sec_workers)
-
-    max_return_primes = int(payload.get("max_return_primes", 5000))
-    include_per_node = bool(payload.get("include_per_node", False))
-    chunk_size = int(payload.get("chunk", 500_000))
-
-    # Initial node snapshot to determine slicing
-    # We want to slice based on currently available capacity, 
-    # but the execution will adapt if nodes drop out.
-    initial_nodes = REGISTRY.active_nodes()
-    if not initial_nodes:
-        # If no nodes initially, we might want to wait or fail. 
-        # The prompt implies we should be robust.
-        # But for 'slicing', we need a number. Let's wait for at least one node.
-        print("[primary] No nodes available at start. Waiting for nodes...")
-        while not initial_nodes:
-            time.sleep(1)
-            initial_nodes = REGISTRY.active_nodes()
-        print(f"[primary] Found {len(initial_nodes)} nodes to start.")
-
-    # Sort for deterministic slicing
-    initial_nodes_sorted = sorted(initial_nodes, key=lambda n: n["node_id"])
-    
-    # We create slices based on the initial view. 
-    # If nodes die, the remaining nodes will iterate through these slices.
-    slices = split_into_slices(low, high, len(initial_nodes_sorted))
-    
-    t0 = time.perf_counter()
-
-    # Track results
-    per_node_results: List[Dict[str, Any]] = []
-    
-    # Work queue: which slices still need to be computed
-    # We store (slice_start, slice_end) tuples
-    pending_slices = slices.copy() 
-    
-    # Failed nodes tracking: node_id -> timestamp_when_failed
-    # We will ignore failed nodes until their 'last_seen' in registry > timestamp_when_failed
-    failed_nodes: Dict[str, float] = {}
-
-    def get_candidates() -> List[Dict[str, Any]]:
-        """
-        Returns list of healthy nodes.
-        Checks registry and filters out known failed nodes 
-        unless they have re-registered (updated last_seen).
-        """
-        current = REGISTRY.active_nodes()
-        healthy = []
-        for n in current:
-            nid = n["node_id"]
-            if nid in failed_nodes:
-                # Check if it has recovered (new heartbeat since failure)
-                if float(n.get("last_seen", 0)) > failed_nodes[nid]:
-                    del failed_nodes[nid]
-                    healthy.append(n)
-                else:
-                    # Still stale/dead
-                    pass
-            else:
-                healthy.append(n)
-        return healthy
-
-    def process_slice(start: int, end: int, node: Dict[str, Any]) -> Dict[str, Any]:
-        """Calls the secondary node for a specific slice."""
-        host = node["host"]
-        port = node["port"]
-        url = f"http://{host}:{port}/compute"
-        req = {
-            "low": start,
-            "high": end,
-            "mode": mode,
-            "chunk": chunk_size,
-            "exec": sec_exec,
-            "workers": sec_workers,
-            "max_return_primes": max_return_primes if mode == "list" else 0,
-            "include_per_chunk": False,
-        }
-        # filter None
-        req = {k: v for k, v in req.items() if v is not None}
-
-        t_call0 = time.perf_counter()
-        resp = _post_json(url, req, timeout_s=3600) 
-        t_call1 = time.perf_counter()
-
-        if not resp.get("ok"):
-            raise RuntimeError(f"node {node['node_id']} returned error: {resp}")
-        
-        node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
-        return {
-            "node_id": node["node_id"],
-            "node": {"host": host, "port": port, "cpu_count": node.get("cpu_count", 1)},
-            "slice": (start, end),
-            "round_trip_s": t_call1 - t_call0,
-            "node_elapsed_s": node_elapsed_s,
-            "node_sum_chunk_s": float(resp.get("sum_chunk_compute_seconds", 0.0)),
-            "total_primes": int(resp.get("total_primes", 0)),
-            "max_prime": int(resp.get("max_prime", -1)),
-            "primes": resp.get("primes", None),
-            "primes_truncated": bool(resp.get("primes_truncated", False)),
-        }
-
-    # Main execution loop
-    # We use a ThreadPoolExecutor, but we manage submissions dynamically
-    # to handle retries and node availability.
-    
-    # We'll use a larger pool to accommodate checking/waiting logic if needed,
-    # but realistically we limit concurrency to the number of slices or nodes.
-    max_concurrent = 32
-    
-    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        # Map: Future -> (slice_start, slice_end, assigned_node_id)
-        future_to_work: Dict[Any, Tuple[int, int, str]] = {}
-        
-        # While there is work to do (pending or in-flight)
-        while pending_slices or future_to_work:
-            
-            # 1. Fill available slots with pending work
-            # Only submit if we have pending slices and we aren't saturating everyone
-            # Ideally we want 1 task per healthy node.
-            
-            candidates = get_candidates()
-            
-            # If no nodes are available at all, we must wait.
-            if not candidates and not future_to_work:
-                print("[primary] No active healthy nodes! Waiting for nodes to recover/register...")
-                time.sleep(2)
-                continue
-
-            # Identify nodes that are currently busy
-            busy_nodes = {assigned_nid for (_, _, assigned_nid) in future_to_work.values()}
-            
-            # Helper to find a free node
-            free_nodes = [n for n in candidates if n["node_id"] not in busy_nodes]
-            
-            # If we have pending tasks and free nodes, submit them
-            while pending_slices and free_nodes:
-                sl = pending_slices.pop(0) # Get next slice
-                node = free_nodes.pop(0)   # Get a free node
-                
-                print(f"[primary] Assigning slice {sl} to node {node['node_id']}")
-                fut = executor.submit(process_slice, sl[0], sl[1], node)
-                future_to_work[fut] = (sl[0], sl[1], node["node_id"])
-
-            # 2. Wait for at least one future to complete (or for nodes to become available if we are stuck)
-            # If we have futures running, check them.
-            if future_to_work:
-                # We use a short timeout so we can periodically check pending_slices/free_nodes
-                # in case a new node appeared (though strictly we only care if we have pending work).
-                # But more importantly, we assume wait() returns fast if things finish.
-                done, not_done = as_completed(future_to_work.keys(), timeout=1.0), [] 
-                
-                # Check actual done list (as_completed yields iterator)
-                # But wait... as_completed is an iterator. We can't use it nicely with a timeout in a loop 
-                # effectively unless we break.
-                # Use executor.submit and manual check? or just `wait()`
-                from concurrent.futures import wait, FIRST_COMPLETED
-                done_futures, not_done_futures = wait(future_to_work.keys(), timeout=1.0, return_when=FIRST_COMPLETED)
-                
-                for f in done_futures:
-                    sl_start, sl_end, assigned_nid = future_to_work.pop(f)
-                    try:
-                        result = f.result()
-                        per_node_results.append(result)
-                        print(f"[primary] Slice {(sl_start, sl_end)} completed by {assigned_nid}")
-                    except Exception as e:
-                        print(f"[primary] Error on node {assigned_nid} for slice {(sl_start, sl_end)}: {e}")
-                        # Mark failed
-                        failed_nodes[assigned_nid] = time.time()
-                        # Re-queue the work
-                        print(f"[primary] Re-queuing slice {(sl_start, sl_end)}")
-                        pending_slices.append((sl_start, sl_end))
-            else:
-                 # No futures running, but maybe we have pending slices (and no free nodes caught in loop above)
-                 # just sleep a bit to avoid hot loop if waiting for nodes
-                 if pending_slices:
-                     time.sleep(1)
-
-
-    # Aggregation (same as before)
-    per_node_results.sort(key=lambda r: r["slice"][0])
-    
-    total_primes = 0
-    max_prime = -1
-    primes_sample: List[int] = []
-    primes_truncated = False
-
-    for r in per_node_results:
-        total_primes += int(r["total_primes"])
-        max_prime = max(max_prime, int(r["max_prime"]))
-        if mode == "list" and r.get("primes") is not None:
-            ps = list(r["primes"])
-            if len(primes_sample) < max_return_primes:
-                remaining = max_return_primes - len(primes_sample)
-                primes_sample.extend(ps[:remaining])
-                if len(ps) > remaining:
-                    primes_truncated = True
-            else:
-                primes_truncated = True
-            if r.get("primes_truncated"):
-                primes_truncated = True
-
-    t1 = time.perf_counter()
-
-    resp: Dict[str, Any] = {
-        "ok": True,
-        "mode": mode,
-        "range": [low, high],
-        "nodes_used": len(set(r["node_id"] for r in per_node_results)),  # count of nodes that actually completed work
-        "secondary_exec": sec_exec,
-        "secondary_workers": sec_workers,
-        "chunk": chunk_size,
-        "total_primes": total_primes,
-        "max_prime": max_prime,
-        "elapsed_seconds": t1 - t0,
-        "sum_node_compute_seconds": sum(float(r["node_elapsed_s"]) for r in per_node_results),
-        "sum_node_round_trip_seconds": sum(float(r["round_trip_s"]) for r in per_node_results),
-    }
-
-    if mode == "list":
-        resp["primes"] = primes_sample
-        resp["primes_truncated"] = primes_truncated
-        resp["max_return_primes"] = max_return_primes
-
-    if include_per_node:
-        resp["per_node"] = per_node_results
-
-    return resp
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "PrimaryPrimeCoordinator/1.0"
-
-    def _send_json(self, obj: Dict[str, Any], code: int = 200) -> None:
-        data = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/health":
-            return self._send_json({"ok": True, "status": "healthy"})
-        if parsed.path == "/nodes":
-            nodes = REGISTRY.active_nodes()
-            nodes.sort(key=lambda n: n["node_id"])
-            return self._send_json({"ok": True, "nodes": nodes, "ttl_s": REGISTRY.ttl_s})
-        return self._send_json({"ok": False, "error": "not found"}, code=404)
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except Exception:
-            return self._send_json({"ok": False, "error": "invalid content-length"}, code=400)
-
-        body = self.rfile.read(length) if length > 0 else b"{}"
-        try:
-            payload = json.loads(body.decode("utf-8") or "{}")
-        except Exception as e:
-            return self._send_json({"ok": False, "error": f"bad json: {e}"}, code=400)
-
-        if parsed.path == "/register":
-            for k in ("node_id", "host", "port"):
-                if k not in payload:
-                    return self._send_json({"ok": False, "error": f"missing field: {k}"}, code=400)
-            rec = REGISTRY.upsert(payload)
-            print(f"[primary_node] Added node: {payload} to registry")
-            return self._send_json({"ok": True, "node": rec})
-
-        if parsed.path == "/compute":
-            try:
-                for k in ("low", "high"):
-                    if k not in payload:
-                        raise ValueError(f"missing field: {k}")
-                resp = distributed_compute(payload)
-                return self._send_json(resp, code=200)
-            except Exception as e:
-                return self._send_json({"ok": False, "error": str(e)}, code=400)
-
-        return self._send_json({"ok": False, "error": "not found"}, code=404)
-
-    def log_message(self, fmt, *args):
-        return
-
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Primary coordinator for distributed prime computation.")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap = argparse.ArgumentParser(description="Primary coordinator for distributed prime computation (gRPC).")
+    ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=9200)
     ap.add_argument("--ttl", type=int, default=3600, help="Seconds to keep node registrations alive (default 3600).")
     args = ap.parse_args()
@@ -401,19 +325,32 @@ def main() -> None:
     global REGISTRY
     REGISTRY = Registry(ttl_s=max(10, int(args.ttl)))
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[primary_node] listening on http://{args.host}:{args.port}")
-    print("  GET  /health")
-    print("  GET  /nodes")
-    print("  POST /register")
-    print("  POST /compute")
+    # Create gRPC server with thread pool
+    server = grpc.server(ThreadPoolExecutor(max_workers=10))
+
+    # Add our CoordinatorService to the server
+    primes_pb2_grpc.add_CoordinatorServiceServicer_to_server(
+        CoordinatorServiceServicer(),
+        server
+    )
+
+    # Bind to address
+    bind_address = f"{args.host}:{args.port}"
+    server.add_insecure_port(bind_address)
+
+    # Start the server
+    server.start()
+
+    print(f"[primary_node] gRPC server listening on {bind_address}")
+    print("  RPC RegisterNode()")
+    print("  RPC ListNodes()")
+    print("  RPC Compute()")
+
     try:
-        httpd.serve_forever()
+        server.wait_for_termination()
     except KeyboardInterrupt:
-        print("\n[primary_node] KeyboardInterrupt received; shutting down gracefully...", flush=True)
-        httpd.shutdown()
-    finally:
-        httpd.server_close()
+        print("\n[primary_node] KeyboardInterrupt received; shutting down gracefully...")
+        server.stop(grace=5)  # 5 seconds grace period
         print("[primary_node] server stopped.")
 
 
