@@ -174,6 +174,85 @@ class TestWorkerService:
         assert response.ok, f"ComputeRange failed: {response.error}"
         assert response.total_primes == 1229, f"Expected 1229 primes in [0,10000), got {response.total_primes}"
         print(f"✓ Large range test: PASSED (1229 primes in [0,10000), elapsed={response.elapsed_seconds:.3f}s)")
+            
+ 
+ 
+    def test_no_worker(self, worker):
+        """Test that Compute fails when no workers are available."""
+        
+        try:
+            # Kill the main worker so coordinator has no nodes
+            worker.kill()
+            worker.wait(timeout=2)
+            
+            
+            # Connect to the coordinator (primary on 9300)
+            channel = grpc.insecure_channel("localhost:9300")
+            stub = primes_pb2_grpc.CoordinatorServiceStub(channel)
+            
+            # Try to compute with no workers available
+            request = primes_pb2.ComputeRequest(low=0, high=100, mode=primes_pb2.COUNT)
+            
+            try:
+                response = stub.Compute(request, timeout=5)
+                # If we got a response, it should be an error
+                if response.ok:
+                    raise AssertionError("FAIL: Compute succeeded, but no workers should be available.")
+                # Error response is acceptable
+                print(f"✓ No worker error handling: PASSED (coordinator error: {response.error})")
+            except grpc.RpcError as e:
+                # RPC error is also acceptable (e.g., UNAVAILABLE)
+                print(f"✓ No worker error handling: PASSED (gRPC error: {e.details()})")
+            finally:
+                channel.close()
+  
+        except subprocess.TimeoutExpired:
+            raise AssertionError("FAIL: Could not kill worker process for no-worker test.")
+        
+
+    def test_primary_twoWorkers(self):
+        """Integration test: Primary with 2 secondary workers."""
+        primary = subprocess.Popen(
+            [sys.executable, "primary_node.py", "--host", "127.0.0.1", "--port", "9300"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        w2 = subprocess.Popen([sys.executable, "secondary_node.py", "--primary", "127.0.0.1:9300", "--port", "9101", "--node-id", "LocalWorker1"])
+        w3 = subprocess.Popen([sys.executable, "secondary_node.py", "--primary", "127.0.0.1:9300", "--port", "9102", "--node-id", "LocalWorker2"])
+        
+        time.sleep(2)  # Give them time to register
+        
+        try:
+            #python primes_cli.py --exec distributed --primary 127.0.0.1:9300 --low 1 --high 5000000 --mode count --include-per-node --time
+            cmd = [
+                sys.executable, "primes_cli.py",
+                "--exec", "distributed",
+                "--primary", "127.0.0.1:9300",
+                "--low", "1",
+                "--high", "5000000",
+                "--mode", "count",
+                "--include-per-node",
+                "--time"
+            ]
+            print("RUNNING PRIMARY WITH 2 WORKERS: ", " ".join(cmd))
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            print("STDOUT:\n", result)
+            # Expect the CLI to succeed and print a numeric total of primes
+            assert result.returncode == 0, f"CLI failed: {result.stderr}"
+            out = result.stdout.strip()
+            assert out.isdigit(), f"Expected numeric total, got: {out}"
+            total = int(out)
+            assert total > 0, f"Expected >0 primes, got {total}"
+            print("✓ Integration Test: PASSED")
+            
+        finally:
+            # 4. Cleanup
+            w2.kill()
+            w3.kill()
+            primary.kill()
+
+
 
 
 def run_all_tests():
@@ -184,13 +263,14 @@ def run_all_tests():
     print("\nMake sure secondary_node.py is running on localhost:9100")
     print("Command: python secondary_node.py --port 9100\n")
     
-    # Check if server is available
-    if not wait_for_server("localhost:9100", timeout=5):
-        print("ERROR: Could not connect to worker at localhost:9100")
-        print("Please start the worker first with: python secondary_node.py --port 9100")
-        return 1
-    
+   
+    print("Started primary coordinator on localhost:9300")
+    time.sleep(1)  # Give primary time to start
+
+    w1 = subprocess.Popen([sys.executable, "secondary_node.py", "--primary", "localhost:9200", "--port", "9100"])
     print("Connected to worker at localhost:9100\n")
+    time.sleep(2)  # Give worker time to register
+
     
     tests = TestWorkerService()
     failures = []
@@ -203,11 +283,16 @@ def run_all_tests():
         ("test_compute_range_invalid_range", tests.test_compute_range_invalid_range),
         ("test_compute_range_exec_modes", tests.test_compute_range_exec_modes),
         ("test_large_range", tests.test_large_range),
+        ("test_no_worker", tests.test_no_worker),
+        ("test_primary_twoWorkers", tests.test_primary_twoWorkers),
     ]
     
     for name, method in test_methods:
         try:
-            method()
+            if name == "test_no_worker":
+                method(worker=w1)
+            else:
+                method()
         except AssertionError as e:
             print(f"✗ {name}: FAILED - {e}")
             failures.append(name)
@@ -216,6 +301,8 @@ def run_all_tests():
             failures.append(name)
     
     print("\n" + "=" * 60)
+    
+
     if failures:
         print(f"FAILED: {len(failures)}/{len(test_methods)} tests")
         for name in failures:

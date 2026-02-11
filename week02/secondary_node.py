@@ -7,7 +7,7 @@ Implements WorkerService (ComputeRange, Health) and registers with coordinator.
 
 Replaces the HTTP-based secondary node from week01.
 
-Command to run this node: python secondary_node.py --port 9301 --primary 127.0.0.1:9200 --node-id worker1
+Command to run this node: python secondary_node.py --port 9301 --primary 127.0.0.1:9300 --node-id worker1
 
 """
 
@@ -286,9 +286,19 @@ def start_registration_loop(
     Uses gRPC instead of HTTP.
     """
     def loop():
+        first_attempt = True
         while True:
             try:
-                channel = grpc.insecure_channel(coordinator_address)
+                # Create fresh channel for each registration attempt to avoid stale connections
+                channel = grpc.insecure_channel(
+                    coordinator_address,
+                    options=[
+                        ('grpc.keepalive_time_ms', 30000),
+                        ('grpc.keepalive_timeout_ms', 5000),
+                        ('grpc.keepalive_permit_without_calls', True),
+                        ('grpc.max_connection_idle_ms', 300000),
+                    ]
+                )
                 stub = primes_pb2_grpc.CoordinatorServiceStub(channel)
                 
                 request = primes_pb2.RegisterNodeRequest(
@@ -299,15 +309,18 @@ def start_registration_loop(
                     timestamp=time.time(),
                 )
                 
-                response = stub.RegisterNode(request, timeout=5)
-                
-                if response.ok:
-                    print(f"[secondary_node] Registered with coordinator: {coordinator_address}")
-                else:
-                    print(f"[secondary_node] Registration failed: {response.error}")
+                try:
+                    response = stub.RegisterNode(request, timeout=10)
                     
-                channel.close()
-                
+                    if response.ok:
+                        if first_attempt:
+                            print(f"[secondary_node] Registered with coordinator: {coordinator_address}")
+                            first_attempt = False
+                    else:
+                        print(f"[secondary_node] Registration failed: {response.error}")
+                finally:
+                    channel.close()
+                    
             except grpc.RpcError as e:
                 print(f"[secondary_node] Registration error: {e.code()}: {e.details()}")
             except Exception as e:
@@ -334,8 +347,14 @@ def serve(
     """Start the gRPC server."""
     cpu_count = os.cpu_count() or 1
     
-    # Create gRPC server
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    # Create gRPC server with proper connection settings
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=[
+            ('grpc.max_concurrent_streams', 100),
+            ('grpc.http2.min_time_between_pings_ms', 30000),
+        ]
+    )
     
     # Add WorkerService servicer
     servicer = WorkerServiceServicer(node_id, advertised_host, port, cpu_count)

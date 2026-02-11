@@ -7,7 +7,7 @@ Implements CoordinatorService: RegisterNode, ListNodes, Compute.
 
 Replaces the HTTP-based primary node from week01.
 
-Command to run: python primary_node.py --host 0.0.0.0 --port 9200 
+Command to run: python primary_node.py --host 127.0.0.1 --port 9300 
 """
 
 from __future__ import annotations
@@ -151,27 +151,35 @@ class CoordinatorServiceServicer(primes_pb2_grpc.CoordinatorServiceServicer):
             t_call0 = time.perf_counter()
 
             # Create gRPC channel (connection) to the worker
-            channel = grpc.insecure_channel(f"{host}:{port}")
-
-            # Create a stub (client) to call the worker's methods
-            stub = primes_pb2_grpc.WorkerServiceStub(channel)
-
-            # Build the request to send to the worker
-            worker_request = primes_pb2.ComputeRequest(
-                low=slice_low,
-                high=slice_high,
-                mode=request.mode,
-                chunk=chunk,
-                exec_mode=request.exec_mode,
-                workers=workers,
-                max_return_primes=max_return_primes if request.mode == primes_pb2.LIST else 0,
+            channel = grpc.insecure_channel(
+                f"{host}:{port}",
+                options=[
+                    ('grpc.max_connection_idle_ms', 300000),
+                    ('grpc.max_connection_age_ms', 600000),
+                ]
             )
 
-            # Call the worker's ComputeRange method (with 1 hour timeout)
-            response = stub.ComputeRange(worker_request, timeout=3600)
+            try:
+                # Create a stub (client) to call the worker's methods
+                stub = primes_pb2_grpc.WorkerServiceStub(channel)
 
-            t_call1 = time.perf_counter()
-            channel.close()
+                # Build the request to send to the worker
+                worker_request = primes_pb2.ComputeRequest(
+                    low=slice_low,
+                    high=slice_high,
+                    mode=request.mode,
+                    chunk=chunk,
+                    exec_mode=request.exec_mode,
+                    workers=workers,
+                    max_return_primes=max_return_primes if request.mode == primes_pb2.LIST else 0,
+                )
+
+                # Call the worker's ComputeRange method (with 1 hour timeout)
+                response = stub.ComputeRange(worker_request, timeout=3600)
+
+                t_call1 = time.perf_counter()
+            finally:
+                channel.close()
 
             # Return PerNodeResult protobuf directly
             return primes_pb2.PerNodeResult(
@@ -327,8 +335,14 @@ def main() -> None:
     global REGISTRY
     REGISTRY = Registry(ttl_s=max(10, int(args.ttl)))
 
-    # Create gRPC server with thread pool
-    server = grpc.server(ThreadPoolExecutor(max_workers=10))
+    # Create gRPC server with thread pool and connection settings
+    server = grpc.server(
+        ThreadPoolExecutor(max_workers=10),
+        options=[
+            ('grpc.max_concurrent_streams', 100),
+            ('grpc.http2.min_time_between_pings_ms', 30000),
+        ]
+    )
 
     # Add our CoordinatorService to the server
     primes_pb2_grpc.add_CoordinatorServiceServicer_to_server(

@@ -8,9 +8,9 @@ Notes
 python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec single --time --mode count
 python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec threads --time --mode count
 python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec processes --time --mode count
-python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec distributed --time --mode count --secondary-exec processes --primary http://127.0.0.1:9200
+python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec distributed --time --mode count --secondary-exec processes --primary http://127.0.0.1:9300
 
-New Command to run for test: python primes_cli.py --exec distributed --primary localhost:9200 --low 1 --high 5000000 --mode count --include-per-node --time
+New Command to run for test: python primes_cli.py --exec distributed --primary 127.0.0.1:9300 --low 1 --high 5000000 --mode count --include-per-node --time
 """
 from __future__ import annotations
 
@@ -173,10 +173,10 @@ def main(argv: list[str]) -> int:
             ]
 
         if args.mode == "count":
-            print(int(resp.get("total_primes", 0)))
+            print(int(resp.get("total_primes", 0))) 
         else:
-            primes = list(resp.get("primes", []))
-            total = int(resp.get("total_primes", len(primes)))
+            primes = list(resp["primes"]) if "primes" in resp else []
+            total = int(resp.get("total_primes", 0))
             shown = primes[: args.max_print]
             print(f"Total primes: {total}")
             print(f"First {len(shown)} primes (from returned sample):")
