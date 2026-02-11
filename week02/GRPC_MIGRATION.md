@@ -15,7 +15,12 @@ cd week02
 python -m grpc_tools.protoc -I./proto --python_out=. --grpc_python_out=. ./proto/primes.proto
 ```
 
-### 3. Run Worker Node
+### 3. Run Coordinator 
+```powershell
+python primary_node.py --host 127.0.0.1 --port 9300 
+```
+
+### 4. Run Worker Node
 ```powershell
 # Standalone (no coordinator)
 python secondary_node.py --port 9100
@@ -24,12 +29,10 @@ python secondary_node.py --port 9100
 python secondary_node.py --port 9100 --primary 127.0.0.1:9200
 ```
 
-### 4. Run Tests
+### 5. Run Tests (Skip steps 3 and 4, do this alone)
 ```powershell
-# Start worker in one terminal
-python secondary_node.py --port 9100
 
-# Run tests in another terminal
+# Run tests in powershell
 python test_grpc_worker.py
 ```
 
