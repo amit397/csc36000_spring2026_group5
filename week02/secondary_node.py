@@ -6,6 +6,9 @@ gRPC worker node for distributed prime-number computation.
 Implements WorkerService (ComputeRange, Health) and registers with coordinator.
 
 Replaces the HTTP-based secondary node from week01.
+
+Command to run this node: python secondary_node.py --port 9301 --primary 127.0.0.1:9200 --node-id worker1
+
 """
 
 from __future__ import annotations

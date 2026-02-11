@@ -9,6 +9,8 @@ python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec single --time --
 python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec threads --time --mode count
 python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec processes --time --mode count
 python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec distributed --time --mode count --secondary-exec processes --primary http://127.0.0.1:9200
+
+New Command to run for test: python primes_cli.py --exec distributed --primary localhost:9200 --low 1 --high 5000000 --mode count --include-per-node --time
 """
 from __future__ import annotations
 
@@ -21,6 +23,9 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from typing import List, Tuple
 from primes_in_range import get_primes
+import grpc
+import primes_pb2
+import primes_pb2_grpc
 
 
 def iter_ranges(low: int, high: int, chunk: int) -> List[Tuple[int, int]]:
@@ -84,23 +89,88 @@ def main(argv: list[str]) -> int:
             return 2
 
         t0 = time.perf_counter()
-        payload = {
-            "low": args.low,
-            "high": args.high,
-            "mode": "list" if return_list else "count",
-            "chunk": args.chunk,
-            "secondary_exec": args.secondary_exec,
-            "secondary_workers": args.secondary_workers,
-            "max_return_primes": args.max_return_primes,
-            "include_per_node": args.include_per_node,
-        }
-        url = args.primary.rstrip("/") + "/compute"
-        resp = _post_json(url, payload, timeout_s=3600)
+
+        # Create channel to primary (coordinator)
+        channel = grpc.insecure_channel(args.primary.replace("http://", ""))
+
+        stub = primes_pb2_grpc.CoordinatorServiceStub(channel)
+
+        # Convert mode string to protobuf enum
+        mode_enum = primes_pb2.LIST if return_list else primes_pb2.COUNT
+
+        # Convert secondary_exec string → protobuf enum
+        if args.secondary_exec == "single":
+            exec_enum = primes_pb2.SINGLE
+        elif args.secondary_exec == "threads":
+            exec_enum = primes_pb2.THREADS
+        elif args.secondary_exec == "processes":
+            exec_enum = primes_pb2.PROCESSES
+        else:
+            print("Invalid --secondary-exec value", file=sys.stderr)
+            return 2
+
+        request = primes_pb2.ComputeRequest(
+            low=args.low,
+            high=args.high,
+            mode=mode_enum,
+            chunk=args.chunk,
+            exec_mode=exec_enum,
+            workers=args.secondary_workers or 0,
+            max_return_primes=args.max_return_primes,
+            include_per_node=args.include_per_node,
+            include_per_chunk=False,
+        )
+
+        response = stub.Compute(request, timeout=3600)
+        channel.close()
+        
         t1 = time.perf_counter()
 
-        if not resp.get("ok"):
-            print(f"Distributed error: {resp}", file=sys.stderr)
+        if not response.ok:
+            print(f"Distributed error: {response.error}", file=sys.stderr)
             return 1
+        
+        # Convert gRPC response → dict format expected by existing CLI logic
+        resp = {
+            "ok": response.ok,
+            "mode": response.mode,
+            "range": [response.range_low, response.range_high],
+            "nodes_used": response.nodes_used,
+            "secondary_exec": response.exec_mode,
+            "secondary_workers": response.workers,
+            "chunk": response.chunk_size,
+            "total_primes": response.total_primes,
+            "max_prime": response.max_prime,
+            "elapsed_seconds": response.elapsed_seconds,
+            "sum_node_compute_seconds": response.sum_node_compute_seconds,
+            "sum_node_round_trip_seconds": response.sum_node_round_trip_seconds,
+        }
+
+        if return_list:
+            resp["primes"] = list(response.primes)
+            resp["primes_truncated"] = response.primes_truncated
+            resp["max_return_primes"] = response.max_return_primes
+
+        if args.include_per_node:
+            resp["per_node"] = [
+                {
+                    "node_id": r.node_id,
+                    "node": {
+                        "host": r.host,
+                        "port": r.port,
+                        "cpu_count": r.cpu_count,
+                    },
+                    "slice": (r.slice_low, r.slice_high),
+                    "round_trip_s": r.round_trip_seconds,
+                    "node_elapsed_s": r.node_elapsed_seconds,
+                    "node_sum_chunk_s": r.sum_chunk_compute_seconds,
+                    "total_primes": r.total_primes,
+                    "max_prime": r.max_prime,
+                    "primes": list(r.primes),
+                    "primes_truncated": r.primes_truncated,
+                }
+                for r in response.per_node
+            ]
 
         if args.mode == "count":
             print(int(resp.get("total_primes", 0)))

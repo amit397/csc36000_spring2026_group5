@@ -6,6 +6,8 @@ gRPC Coordinator for distributed prime-number computation.
 Implements CoordinatorService: RegisterNode, ListNodes, Compute.
 
 Replaces the HTTP-based primary node from week01.
+
+Command to run: python primary_node.py --host 0.0.0.0 --port 9200 
 """
 
 from __future__ import annotations
