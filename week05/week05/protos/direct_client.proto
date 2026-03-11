@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package direct;
+
+service DirectGateway {
+  // Send a direct message to a peer. Gateway routes to the correct Raft leader.
+  rpc SendDirect(SendDirectRequest) returns (SendDirectResponse);
+
+  // Stream messages for a 1:1 conversation (including my outgoing + peer incoming),
+  // resuming after a sequence number.
+  rpc SubscribeConversation(SubscribeConversationRequest) returns (stream DirectEvent);
+
+  // Pull history (for startup or reconnect catch-up).
+  rpc GetConversationHistory(GetConversationHistoryRequest) returns (GetConversationHistoryResponse);
+}
+
+// The conversation id is deterministically derived from the two user ids.
+// For example: conv_id = min(a,b) + "|" + max(a,b)
+message SendDirectRequest {
+  string from_user = 1;
+  string to_user = 2;
+
+  // Idempotency keys to make client retries safe.
+  string client_id = 3;
+  string client_msg_id = 4;
+
+  string text = 5;
+}
+
+message SendDirectResponse {
+  // Monotonic sequence number for this conversation assigned by the replicated state machine.
+  uint64 seq = 1;
+  int64 server_time_ms = 2;
+}
+
+message SubscribeConversationRequest {
+  string user_a = 1;
+  string user_b = 2;
+
+  // Resume from last seen sequence (0 means "from now" depending on gateway implementation).
+  uint64 after_seq = 3;
+}
+
+message DirectEvent {
+  uint64 seq = 1;
+  int64 server_time_ms = 2;
+
+  // Conversation participants + sender
+  string user_a = 3;
+  string user_b = 4;
+  string from_user = 5;
+
+  // Idempotency info (useful for dedup)
+  string client_id = 6;
+  string client_msg_id = 7;
+
+  string text = 8;
+}
+
+message GetConversationHistoryRequest {
+  string user_a = 1;
+  string user_b = 2;
+
+  uint64 after_seq = 3;
+  uint32 limit = 4;
+}
+
+message GetConversationHistoryResponse {
+  repeated DirectEvent events = 1;
+}
