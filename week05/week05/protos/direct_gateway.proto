@@ -1,0 +1,50 @@
+syntax = "proto3";
+package direct;
+
+service DirectGateway {
+  rpc SendDirect(SendDirectRequest) returns (SendDirectResponse);
+  rpc GetConversationHistory(GetConversationHistoryRequest) returns (GetConversationHistoryResponse);
+}
+
+message SendDirectRequest {
+  string from_user = 1;
+  string to_user = 2;
+  string client_id = 3;
+  string client_msg_id = 4;
+  string text = 5;
+}
+
+message SendDirectResponse {
+  uint64 seq = 1;
+}
+
+enum ReadPreference {
+  LEADER_ONLY = 0;
+  ANY_REPLICA = 1;
+  REPLICA_HINT = 2; // use replica_hint if possible
+}
+
+message GetConversationHistoryRequest {
+  string user_a = 1;
+  string user_b = 2;
+  uint64 after_seq = 3;
+  uint32 limit = 4;
+
+  ReadPreference read_pref = 5;
+  string replica_hint = 6; // host:port if read_pref == REPLICA_HINT
+}
+
+message DirectEvent {
+  uint64 seq = 1;
+  string from_user = 2;
+  string text = 3;
+  int64 server_time_ms = 4;
+
+  string client_id = 5;
+  string client_msg_id = 6;
+}
+
+message GetConversationHistoryResponse {
+  repeated DirectEvent events = 1;
+  repeated string served_by = 2; // list of replica addrs used for this read
+}
