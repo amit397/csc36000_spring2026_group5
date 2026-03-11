@@ -33,14 +33,13 @@ def _ensure_scripts_exist():
 
 def _compile_protos():
     GEN_DIR.mkdir(parents=True, exist_ok=True)
+    protos = list(PROTO_DIR.glob("*.proto"))
     cmd = [
         sys.executable, "-m", "grpc_tools.protoc",
         f"-I{PROTO_DIR}",
         f"--python_out={GEN_DIR}",
         f"--grpc_python_out={GEN_DIR}",
-        str(PROTO_DIR / "direct_gateway.proto"),
-        str(PROTO_DIR / "replica_admin.proto"),
-    ]
+    ] + [str(p) for p in protos]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         pytest.fail(
@@ -95,10 +94,13 @@ def get_replica_statuses(replica_addrs: List[str]):
     _, _, _, rep_pb2, rep_grpc = import_stubs()
     statuses = []
     for addr in replica_addrs:
-        ch = wait_for_port(addr, timeout=5.0)
-        stub = rep_grpc.ReplicaAdminStub(ch)
-        resp = stub.Status(rep_pb2.StatusRequest(), timeout=2.0)
-        statuses.append((addr, resp))
+        try:
+            ch = wait_for_port(addr, timeout=5.0)
+            stub = rep_grpc.ReplicaAdminStub(ch)
+            resp = stub.Status(rep_pb2.StatusRequest(), timeout=5.0)
+            statuses.append((addr, resp))
+        except Exception:
+            pass
     return statuses
 
 def pick_leader(statuses):
@@ -111,6 +113,10 @@ def pick_leader(statuses):
 def cluster():
     _ensure_scripts_exist()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Force stop any pre-existing cluster before starting fresh
+    _run([sys.executable, str(SCRIPTS_DIR / "stop_cluster.py")], cwd=ROOT, check=False)
+    time.sleep(1.0) # Give Windows time to release port handles
 
     proc = _run([sys.executable, str(SCRIPTS_DIR / "run_cluster.py")], cwd=ROOT, check=False)
     if proc.returncode != 0:

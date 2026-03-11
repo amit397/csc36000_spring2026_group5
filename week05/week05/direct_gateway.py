@@ -65,24 +65,27 @@ class DirectGatewayServicer(gateway_grpc.DirectGatewayServicer):
             except Exception:
                 pass
 
-        # Search all replicas
-        for addr in self.replica_addrs:
-            try:
-                status = await self._get_status(addr)
-                if status and status.role == replica_admin_pb2.LEADER:
-                    self.leader_addr = addr
-                    return addr
-                elif status and status.leader_hint:
-                    # Use hint
-                    try:
-                        hint_status = await self._get_status(status.leader_hint)
-                        if hint_status and hint_status.role == replica_admin_pb2.LEADER:
-                            self.leader_addr = status.leader_hint
-                            return status.leader_hint
-                    except Exception:
-                        pass
-            except Exception:
-                continue
+        # Search all replicas with a few retries for election to settle
+        for attempt in range(10):
+            for addr in self.replica_addrs:
+                try:
+                    status = await self._get_status(addr)
+                    if status and status.role == replica_admin_pb2.LEADER:
+                        self.leader_addr = addr
+                        return addr
+                    elif status and status.leader_hint:
+                        # Use hint
+                        try:
+                            hint_status = await self._get_status(status.leader_hint)
+                            if hint_status and hint_status.role == replica_admin_pb2.LEADER:
+                                self.leader_addr = status.leader_hint
+                                return status.leader_hint
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+            if attempt < 2:
+                await asyncio.sleep(0.5)
 
         return None
 
@@ -90,7 +93,7 @@ class DirectGatewayServicer(gateway_grpc.DirectGatewayServicer):
         """Return True if the replica at addr responds to a channel-ready check within 1 s."""
         try:
             async with grpc.aio.insecure_channel(addr) as channel:
-                await asyncio.wait_for(channel.channel_ready(), timeout=1.0)
+                await asyncio.wait_for(channel.channel_ready(), timeout=3.0)
                 return True
         except Exception:
             return False

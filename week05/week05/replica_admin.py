@@ -391,7 +391,7 @@ async def serve(host: str, port: int, peer_addrs: list[str]):
 
         # Schedule actual shutdown after grace period
         async def _delayed_stop():
-            await asyncio.sleep(60.0)
+            await asyncio.sleep(5.0)
             await server.stop(0)
 
         loop.create_task(_delayed_stop())

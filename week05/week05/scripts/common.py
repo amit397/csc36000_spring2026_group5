@@ -69,18 +69,25 @@ import time
 def best_effort_stop_pid(pid: Any) -> None:
     if not isinstance(pid, int):
         return
+    # On Windows, try taskkill first for a more definitive kill
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    
     try:
         os.kill(pid, signal.SIGTERM)
-        # On Windows, TerminateProcess is async. Loop and wait.
         if sys.platform == "win32":
-            deadline = time.time() + 3.0
+            deadline = time.time() + 5.0
             while time.time() < deadline:
                 try:
                     os.kill(pid, 0)
                     time.sleep(0.1)
                 except BaseException:
                     break
-    except OSError:
+    except Exception:
         pass
 
 
