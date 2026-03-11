@@ -39,12 +39,23 @@ class ReplicaAdminStub(object):
                 request_serializer=replica__admin__pb2.StatusRequest.SerializeToString,
                 response_deserializer=replica__admin__pb2.StatusResponse.FromString,
                 _registered_method=True)
+        self.GetMessages = channel.unary_unary(
+                '/replica.ReplicaAdmin/GetMessages',
+                request_serializer=replica__admin__pb2.GetMessagesRequest.SerializeToString,
+                response_deserializer=replica__admin__pb2.GetMessagesResponse.FromString,
+                _registered_method=True)
 
 
 class ReplicaAdminServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def Status(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMessages(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -57,6 +68,11 @@ def add_ReplicaAdminServicer_to_server(servicer, server):
                     servicer.Status,
                     request_deserializer=replica__admin__pb2.StatusRequest.FromString,
                     response_serializer=replica__admin__pb2.StatusResponse.SerializeToString,
+            ),
+            'GetMessages': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMessages,
+                    request_deserializer=replica__admin__pb2.GetMessagesRequest.FromString,
+                    response_serializer=replica__admin__pb2.GetMessagesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -86,6 +102,33 @@ class ReplicaAdmin(object):
             '/replica.ReplicaAdmin/Status',
             replica__admin__pb2.StatusRequest.SerializeToString,
             replica__admin__pb2.StatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMessages(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/replica.ReplicaAdmin/GetMessages',
+            replica__admin__pb2.GetMessagesRequest.SerializeToString,
+            replica__admin__pb2.GetMessagesResponse.FromString,
             options,
             channel_credentials,
             insecure,

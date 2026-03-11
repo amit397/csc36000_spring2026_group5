@@ -49,6 +49,11 @@ class RaftNodeStub(object):
                 request_serializer=raft__internal__pb2.SubmitCommandRequest.SerializeToString,
                 response_deserializer=raft__internal__pb2.SubmitCommandResponse.FromString,
                 _registered_method=True)
+        self.GetCommittedMessages = channel.unary_unary(
+                '/raft.RaftNode/GetCommittedMessages',
+                request_serializer=raft__internal__pb2.GetCommittedMessagesRequest.SerializeToString,
+                response_deserializer=raft__internal__pb2.GetCommittedMessagesResponse.FromString,
+                _registered_method=True)
 
 
 class RaftNodeServicer(object):
@@ -72,6 +77,12 @@ class RaftNodeServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetCommittedMessages(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RaftNodeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -89,6 +100,11 @@ def add_RaftNodeServicer_to_server(servicer, server):
                     servicer.SubmitCommand,
                     request_deserializer=raft__internal__pb2.SubmitCommandRequest.FromString,
                     response_serializer=raft__internal__pb2.SubmitCommandResponse.SerializeToString,
+            ),
+            'GetCommittedMessages': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetCommittedMessages,
+                    request_deserializer=raft__internal__pb2.GetCommittedMessagesRequest.FromString,
+                    response_serializer=raft__internal__pb2.GetCommittedMessagesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -172,6 +188,33 @@ class RaftNode(object):
             '/raft.RaftNode/SubmitCommand',
             raft__internal__pb2.SubmitCommandRequest.SerializeToString,
             raft__internal__pb2.SubmitCommandResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetCommittedMessages(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/raft.RaftNode/GetCommittedMessages',
+            raft__internal__pb2.GetCommittedMessagesRequest.SerializeToString,
+            raft__internal__pb2.GetCommittedMessagesResponse.FromString,
             options,
             channel_credentials,
             insecure,

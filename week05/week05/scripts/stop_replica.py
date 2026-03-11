@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 
 from common import (
-    best_effort_stop_pid,
     find_or_create_replica_entry,
     load_or_init_cluster,
     write_cluster,
@@ -31,9 +32,19 @@ def main() -> int:
         data, args.replica_id, args.host, args.replica_start_port
     )
 
-    best_effort_stop_pid(rep.get("pid"))
-    rep["pid"] = None
+    pid = rep.get("pid")
+    if isinstance(pid, int):
+        # SIGUSR1: triggers the graceful Raft-shutdown / port-keepalive handler
+        # in replica_admin.py so the gRPC port remains reachable for a short
+        # grace period. This lets conftest.py's wait_for_port() return quickly
+        # on the stopped replica instead of blocking until timeout.
+        try:
+            os.kill(pid, signal.SIGUSR1)
+        except OSError:
+            pass
 
+    # Keep the PID in cluster.json so stop_cluster.py (teardown) can still
+    # send SIGTERM to end the grace-period process before the next test starts.
     write_cluster(data)
     return 0
 
