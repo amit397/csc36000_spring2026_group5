@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -63,11 +64,22 @@ def find_or_create_replica_entry(
     return rep
 
 
+import time
+
 def best_effort_stop_pid(pid: Any) -> None:
     if not isinstance(pid, int):
         return
     try:
         os.kill(pid, signal.SIGTERM)
+        # On Windows, TerminateProcess is async. Loop and wait.
+        if sys.platform == "win32":
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.1)
+                except BaseException:
+                    break
     except OSError:
         pass
 

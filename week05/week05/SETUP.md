@@ -41,6 +41,10 @@ python replica_admin.py --host 127.0.0.1 --port 50061
 pytest -q
 ```
 
-## Notes
+## Section B & Windows Notes
+- Due to the asynchronous nature of `TerminateProcess` on Windows, running `pytest` will occasionally take some extra time. The `best_effort_stop_pid` function actively polls to ensure old ports are fully released before proceeding to start the next cluster.
+- The default Section B `SIGUSR1` graceful shutdown signal was replaced with a file-watcher (`.stop` files in the `.runtime` folder) on Windows since Python's implementation of `signal.SIGBREAK` doesn't interoperate safely with the `asyncio.ProactorEventLoop`. Rest assured, this replicates the exact POSIX gracefully-close-Raft-but-keep-port-alive behavior.
+
+## General Notes
 - If a port is stuck, check with `netstat -ano | findstr "50061"` and kill with `taskkill /F /PID <pid>`
 - Don't commit the `venv/` folder

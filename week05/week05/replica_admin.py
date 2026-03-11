@@ -25,15 +25,8 @@ class StateMachine:
     def __init__(self):
         # Stores (user_a, user_b) -> list of message dicts
         self.conversations: dict[tuple[str, str], list] = {}
-        # Stores (client_id, client_msg_id) to prevent duplicate processing
-        self.dedup_set: set[tuple[str, str]] = set() 
-
-    def get_messages(self, user_a, user_b, after_seq, limit):
-        key = (user_a, user_b)
-        all_msgs = self.conversations.get(key, [])
-        # Filter by sequence and apply limit
-        filtered = [m for m in all_msgs if m["seq"] > after_seq]
-        return filtered[:limit]
+        # Maps (client_id, client_msg_id) -> committed seq for dedup + idempotent retries
+        self.dedup_table: dict[tuple[str, str], int] = {}
 
     def last_log_index(self, log) -> int:
         return len(log)
@@ -42,6 +35,12 @@ class StateMachine:
         if log:
             return log[-1]["term"]
         return 0
+
+    def lookup_dedup(self, client_id: str, client_msg_id: str):
+        """Check if a (client_id, client_msg_id) was already applied.
+        Returns the original committed seq if found, None otherwise.
+        Used by SubmitCommand to short-circuit before appending to the Raft log."""
+        return self.dedup_table.get((client_id, client_msg_id))
     
     def apply(self, log_index: int, data: bytes) -> int:
         try:
@@ -49,9 +48,10 @@ class StateMachine:
         except Exception:
             return -1
         
-        dedup_key = (msg.get("client_id"), msg.get("client_msg_id"))
-        if dedup_key in self.dedup_set:
-            return -1
+        dedup_key = (msg.get("client_id", ""), msg.get("client_msg_id", ""))
+        if dedup_key in self.dedup_table:
+            # Already applied — return original seq (idempotent)
+            return self.dedup_table[dedup_key]
         
         msg["seq"] = log_index
         msg["server_time_ms"] = int(time.time() * 1000)
@@ -60,7 +60,7 @@ class StateMachine:
         if key not in self.conversations:
             self.conversations[key] = []
         self.conversations[key].append(msg)
-        self.dedup_set.add(dedup_key)
+        self.dedup_table[dedup_key] = log_index
         return log_index
     
     def get_messages(self, user_a: str, user_b: str, after_seq: int, limit: int) -> list:
@@ -299,12 +299,32 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer, raft_int
         if self._stopped or self.role != replica_admin_pb2.LEADER:
             return raft_internal_pb2.SubmitCommandResponse(success=False, log_index=0, leader_hint=self.leader_hint)
 
+        # Leader-side dedup: if already committed, return the original seq immediately.
+        # This avoids bloating the Raft log with duplicate entries and speeds up
+        # client retries.  Also keeps the log lean for Part C recovery catch-up.
+        try:
+            payload = json.loads(request.data.decode())
+            existing_seq = self.state_machine.lookup_dedup(
+                payload.get("client_id", ""), payload.get("client_msg_id", "")
+            )
+            if existing_seq is not None:
+                return raft_internal_pb2.SubmitCommandResponse(success=True, log_index=existing_seq)
+        except Exception:
+            pass  # Malformed data will be caught by apply()
+
         self.log.append({"term": self.term, "data": request.data})
         entry_index = len(self.log)
 
         for _ in range(100):
             if self.commit_index >= entry_index:
-                return raft_internal_pb2.SubmitCommandResponse(success=True, log_index=entry_index)
+                # Retrieve the actual sequence number assigned/deduped by the state machine
+                try:
+                    payload = json.loads(request.data.decode())
+                    dedup_key = (payload.get("client_id", ""), payload.get("client_msg_id", ""))
+                    final_seq = self.state_machine.dedup_table.get(dedup_key, entry_index)
+                except Exception:
+                    final_seq = entry_index
+                return raft_internal_pb2.SubmitCommandResponse(success=True, log_index=final_seq)
             if self.role != replica_admin_pb2.LEADER:
                 break
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -371,12 +391,30 @@ async def serve(host: str, port: int, peer_addrs: list[str]):
 
         # Schedule actual shutdown after grace period
         async def _delayed_stop():
-            await asyncio.sleep(10.0)
+            await asyncio.sleep(60.0)
             await server.stop(0)
 
         loop.create_task(_delayed_stop())
 
-    loop.add_signal_handler(signal.SIGUSR1, _on_sigterm)
+    if sys.platform != "win32" and hasattr(signal, 'SIGUSR1'):
+        try:
+            loop.add_signal_handler(signal.SIGUSR1, _on_sigterm)
+        except NotImplementedError:
+            pass
+    elif sys.platform == "win32":
+        async def _watch_stop_file():
+            stop_file = Path(__file__).resolve().parent / ".runtime" / f"replica_{servicer.node_id}.stop"
+            while not servicer._stopped:
+                if stop_file.exists():
+                    print(f"Node {servicer.node_id}: Stop file found — stopping Raft, keeping port alive", file=sys.stderr)
+                    _on_sigterm()
+                    try:
+                        stop_file.unlink()
+                    except OSError:
+                        pass
+                    break
+                await asyncio.sleep(0.1)
+        loop.create_task(_watch_stop_file())
 
     try:
         await server.wait_for_termination()

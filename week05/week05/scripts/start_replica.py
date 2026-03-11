@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from common import (
     ROOT,
     RUNTIME_DIR,
@@ -40,6 +41,13 @@ def main() -> int:
     port = args.replica_start_port + (args.replica_id - 1)
     host = args.host
     addr = f"{host}:{port}"
+    
+    stop_file = Path(__file__).resolve().parent.parent / ".runtime" / f"replica_{args.replica_id}.stop"
+    if stop_file.exists():
+        try:
+            stop_file.unlink()
+        except OSError:
+            pass
 
     proc = start_process(
         [

@@ -28,13 +28,6 @@ from generated import raft_internal_pb2_grpc
 ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = ROOT / ".runtime"
 CLUSTER_JSON = RUNTIME_DIR / "cluster.json"
-ROOT = Path(__file__).resolve().parent
-RUNTIME_DIR = ROOT / ".runtime"
-CLUSTER_JSON = RUNTIME_DIR / "cluster.json"
-
-ROOT = Path(__file__).resolve().parent
-RUNTIME_DIR = ROOT / ".runtime"
-CLUSTER_JSON = RUNTIME_DIR / "cluster.json"
 
 
 class DirectGatewayServicer(gateway_grpc.DirectGatewayServicer):
@@ -261,8 +254,8 @@ class DirectGatewayServicer(gateway_grpc.DirectGatewayServicer):
                     except Exception as e:
                         print(f"[gateway] error reading from leader: {e}", file=sys.stderr)
             
-            # If still no messages, try any replica
-            if messages is None:
+            # If still no messages, try any replica (only if ANY_REPLICA or if we want to fallback arbitrarily? Actually, only fallback if ANY_REPLICA is allowed)
+            if messages is None and read_pref == 1:
                 for addr in self.replica_addrs:
                     try:
                         async with grpc.aio.insecure_channel(addr) as channel:
@@ -283,7 +276,9 @@ class DirectGatewayServicer(gateway_grpc.DirectGatewayServicer):
                         continue
             
             if messages is None:
-                messages = []
+                context.set_details("No suitable replica found to serve read")
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+                return gateway_pb.GetConversationHistoryResponse()
             
             # Convert to DirectEvent format
             events = [

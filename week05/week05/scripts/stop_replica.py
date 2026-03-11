@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import sys
+from pathlib import Path
 
 from common import (
     find_or_create_replica_entry,
@@ -39,7 +41,16 @@ def main() -> int:
         # grace period. This lets conftest.py's wait_for_port() return quickly
         # on the stopped replica instead of blocking until timeout.
         try:
-            os.kill(pid, signal.SIGUSR1)
+            if sys.platform == "win32":
+                stop_file = Path(__file__).resolve().parent.parent / ".runtime" / f"replica_{args.replica_id}.stop"
+                try:
+                    stop_file.touch()
+                except OSError:
+                    pass
+            elif hasattr(signal, 'SIGUSR1'):
+                os.kill(pid, signal.SIGUSR1)
+            else:
+                os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
 
