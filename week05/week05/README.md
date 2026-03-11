@@ -256,3 +256,4 @@ These tests are strong black-box checks, but they are not a full formal proof of
 
 ## Academic honesty
 All team members must contribute. Use Git commits and (optionally) a short `CONTRIBUTIONS.md` to document roles.
+ 
