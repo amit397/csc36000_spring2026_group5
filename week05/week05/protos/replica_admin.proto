@@ -3,6 +3,7 @@ package replica;
 
 service ReplicaAdmin {
   rpc Status(StatusRequest) returns (StatusResponse);
+  rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
 }
 
 message StatusRequest {}
@@ -21,4 +22,25 @@ message StatusResponse {
   int64 last_log_index = 5;
   uint64 last_log_term = 6;
   int64 commit_index = 7;
+}
+message Message {
+  uint64 seq = 1;
+  string user_a = 2;
+  string user_b = 3;
+  string from_user = 4;
+  string text = 5;
+  string client_id = 6;
+  string client_msg_id = 7;
+  int64 server_time_ms = 8;
+}
+
+message GetMessagesRequest {
+  string user_a = 1;
+  string user_b = 2;
+  uint64 after_seq = 3;
+  uint32 limit = 4;
+}
+
+message GetMessagesResponse {
+  repeated Message messages = 1;
 }

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -46,8 +47,13 @@ def _post_json(url: str, payload: dict, timeout_s: int = 3600) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try: 
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp: # Line causing errors
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"Error posting to URL {url}: {e}", file=sys.stderr)
+    except socket.timeout as e:
+        print(f"Timeout posting to URL {url}: {e}", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -95,6 +101,7 @@ def main(argv: list[str]) -> int:
             "include_per_node": args.include_per_node,
         }
         url = args.primary.rstrip("/") + "/compute"
+        print(f"Posting to primary node at {url} ...", file=sys.stderr)
         resp = _post_json(url, payload, timeout_s=3600)
         t1 = time.perf_counter()
 

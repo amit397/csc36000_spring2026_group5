@@ -7,11 +7,17 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
+
+# Add generated folder to path for proto imports
+sys.path.insert(0, str(Path(__file__).resolve().parent / "generated"))
 
 import grpc
 
-from generated import direct_client_pb2 as pb
-from generated import direct_client_pb2_grpc as pb_grpc
+import direct_client_pb2 as pb
+import direct_gateway_pb2 as gw_pb
+import direct_gateway_pb2_grpc as gw_grpc
+
 
 
 @dataclass
@@ -49,7 +55,7 @@ class DirectChatClient:
 
     async def run(self) -> int:
         async with grpc.aio.insecure_channel(self.cfg.gateway_addr) as channel:
-            stub = pb_grpc.DirectGatewayStub(channel)
+            stub = gw_grpc.DirectGatewayStub(channel)
 
             await self._catch_up_history(stub)
 
@@ -77,7 +83,7 @@ class DirectChatClient:
     async def _catch_up_history(self, stub: pb_grpc.DirectGatewayStub) -> None:
         try:
             resp = await stub.GetConversationHistory(
-                pb.GetConversationHistoryRequest(
+                gw_pb.GetConversationHistoryRequest(
                     user_a=self.user_a,
                     user_b=self.user_b,
                     after_seq=0,

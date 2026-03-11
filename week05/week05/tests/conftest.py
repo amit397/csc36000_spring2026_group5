@@ -69,11 +69,12 @@ def wait_for_port(addr: str, timeout: float = 10.0):
     return ch
 
 def import_stubs():
-    import direct_gateway_pb2 as direct_pb2
-    import direct_gateway_pb2_grpc as direct_grpc
+    import direct_client_pb2 as client_pb2
+    import direct_gateway_pb2 as gateway_pb2
+    import direct_gateway_pb2_grpc as gateway_grpc
     import replica_admin_pb2 as rep_pb2
     import replica_admin_pb2_grpc as rep_grpc
-    return direct_pb2, direct_grpc, rep_pb2, rep_grpc
+    return client_pb2, gateway_pb2, gateway_grpc, rep_pb2, rep_grpc
 
 def wait_until(fn, timeout: float = 10.0, interval: float = 0.1, desc: str = "condition"):
     end = time.time() + timeout
@@ -91,7 +92,7 @@ def wait_until(fn, timeout: float = 10.0, interval: float = 0.1, desc: str = "co
     raise AssertionError(f"Timed out waiting for {desc}.")
 
 def get_replica_statuses(replica_addrs: List[str]):
-    _, _, rep_pb2, rep_grpc = import_stubs()
+    _, _, _, rep_pb2, rep_grpc = import_stubs()
     statuses = []
     for addr in replica_addrs:
         ch = wait_for_port(addr, timeout=5.0)
@@ -139,10 +140,17 @@ def cluster():
 
 @pytest.fixture()
 def gateway_stub(cluster):
-    direct_pb2, direct_grpc, _, _ = import_stubs()
+    client_pb2, gateway_pb2, gateway_grpc, _, _ = import_stubs()
     gw_addr = cluster["gateway"]["addr"]
     ch = wait_for_port(gw_addr, timeout=10.0)
-    return direct_pb2, direct_grpc.DirectGatewayStub(ch)
+    class CombinedProto:
+        def __getattr__(self, name):
+            if hasattr(client_pb2, name):
+                return getattr(client_pb2, name)
+            if hasattr(gateway_pb2, name):
+                return getattr(gateway_pb2, name)
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+    return CombinedProto(), gateway_grpc.DirectGatewayStub(ch)
 
 def ordered_users(u1: str, u2: str) -> Tuple[str, str]:
     return (u1, u2) if u1 <= u2 else (u2, u1)

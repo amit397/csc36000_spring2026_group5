@@ -358,16 +358,19 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     ap = argparse.ArgumentParser(description="Secondary prime worker node (HTTP server).")
     ap.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
-    ap.add_argument("--port", type=int, default=9100, help="Bind port (default 9100).")
+    ap.add_argument("--port", type=int, default=9100, help="Bind port (default 9100). Use 0 for auto.")
     ap.add_argument("--node-id", default=None, help="Optional stable node id (default: hostname).")
-
-    ap.add_argument("--primary", default=None, help="Primary coordinator URL, e.g. http://134.74.160.1:9200")
+    ap.add_argument("--primary", default=None, help="Primary coordinator URL, e.g. http://127.0.0.1:9200")
     ap.add_argument("--public-host", default=None, help="Host/IP to advertise to primary (default: auto-detect).")
-    ap.add_argument("--register-interval", type=int, default=3600, help="Seconds between heartbeats (default 3600).")
+    ap.add_argument("--register-interval", type=int, default=60, help="Seconds between heartbeats.")
 
     args = ap.parse_args()
+    node_id = args.node_id or socket.gethostname()
 
-    node_id = args.node_id or os.uname().nodename
+    ThreadingHTTPServer.allow_reuse_address = True
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    
+    actual_host, actual_port = httpd.server_address
 
     advertised_host = args.public_host
     if args.primary and not advertised_host:
@@ -377,10 +380,10 @@ def main() -> None:
 
     NODE_META.update({
         "node_id": node_id,
-        "bind_host": args.host,
-        "bind_port": args.port,
+        "bind_host": actual_host,
+        "bind_port": actual_port,
         "advertised_host": advertised_host,
-        "advertised_port": args.port,
+        "advertised_port": actual_port,
         "cpu_count": os.cpu_count() or 1,
         "registered_to": args.primary,
     })
@@ -390,27 +393,21 @@ def main() -> None:
             args.primary,
             node_id=node_id,
             host=advertised_host,
-            port=args.port,
+            port=actual_port,
             interval_s=max(5, int(args.register_interval)),
         )
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[secondary_node] node_id={node_id}")
-    print(f"[secondary_node] listening on http://{args.host}:{args.port}")
-    print(f"[secondary_node] advertised as http://{advertised_host}:{args.port}")
-    if args.primary:
-        print(f"[secondary_node] registering to primary: {args.primary}")
-    print("  GET  /health")
-    print("  GET  /info")
-    print("  POST /compute")
+    print(f"[secondary_node] listening on http://{actual_host}:{actual_port}")
+    print(f"[secondary_node] advertised as http://{advertised_host}:{actual_port}")
+    
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[secondary_node] KeyboardInterrupt received; shutting down gracefully...", flush=True)
+        print("\n[secondary_node] Shutting down...", flush=True)
         httpd.shutdown()
     finally:
         httpd.server_close()
-        print("[secondary_node] server stopped.")
 
 
 if __name__ == "__main__":

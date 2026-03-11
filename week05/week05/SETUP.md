@@ -16,7 +16,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 pip install -r requirements.txt
 ```
 
-## 3. Generate gRPC stubs
+## 3. Generate gRPC stubs 
 ```powershell
 Get-ChildItem protos\*.proto | ForEach-Object { python -m grpc_tools.protoc -I protos --python_out=generated --grpc_python_out=generated $_.Name }
 ```

@@ -5,6 +5,7 @@ service RaftNode {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc SubmitCommand(SubmitCommandRequest) returns (SubmitCommandResponse);
+  rpc GetCommittedMessages(GetCommittedMessagesRequest) returns (GetCommittedMessagesResponse);
 }
 
 message RequestVoteRequest {
@@ -46,4 +47,25 @@ message SubmitCommandResponse {
   bool success = 1;
   uint64 log_index = 2;  // index where the entry was committed
   string leader_hint = 3;  // if not leader, tells gateway who is
+}
+message CommittedMessage {
+  uint64 seq = 1;
+  string user_a = 2;
+  string user_b = 3;
+  string from_user = 4;
+  string text = 5;
+  string client_id = 6;
+  string client_msg_id = 7;
+  int64 server_time_ms = 8;
+}
+
+message GetCommittedMessagesRequest {
+  string user_a = 1;
+  string user_b = 2;
+  uint64 after_seq = 3;
+  uint32 limit = 4;
+}
+
+message GetCommittedMessagesResponse {
+  repeated CommittedMessage messages = 1;
 }
