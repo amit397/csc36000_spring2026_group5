@@ -2,7 +2,7 @@ syntax = "proto3";
 package direct;
 
 // Import the base messages from the client proto
-import "direct_client.proto";
+import public "direct_client.proto";
 
 service DirectGateway {
   rpc SendDirect(SendDirectRequest) returns (SendDirectResponse);
