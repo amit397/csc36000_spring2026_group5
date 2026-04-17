@@ -1,0 +1,158 @@
+syntax = "proto3";
+package week09;
+
+service Week09Gateway {
+  rpc CreateSection(CreateSectionRequest) returns (CreateSectionResponse);
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  rpc Drop(DropRequest) returns (DropResponse);
+  rpc GetStudentSchedule(GetStudentScheduleRequest) returns (GetStudentScheduleResponse);
+  rpc GetSectionRoster(GetSectionRosterRequest) returns (GetSectionRosterResponse);
+
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+  rpc Transfer(TransferRequest) returns (TransferResponse);
+
+  rpc CreateInventoryItem(CreateInventoryItemRequest) returns (CreateInventoryItemResponse);
+  rpc ReserveItem(ReserveItemRequest) returns (ReserveItemResponse);
+  rpc ReleaseReservation(ReleaseReservationRequest) returns (ReleaseReservationResponse);
+  rpc GetInventory(GetInventoryRequest) returns (GetInventoryResponse);
+}
+
+message RoutingInfo {
+  int32 logical_shard_id = 1;
+  string storage_addr = 2;
+}
+
+message CreateSectionRequest {
+  string section_id = 1;
+  uint32 capacity = 2;
+}
+
+message CreateSectionResponse {
+  string section_id = 1;
+  uint32 capacity = 2;
+  RoutingInfo routing = 3;
+}
+
+message EnrollRequest {
+  string student_id = 1;
+  string section_id = 2;
+}
+
+message EnrollResponse {
+  bool committed = 1;
+  uint32 enrolled_count = 2;
+  uint32 capacity = 3;
+  repeated RoutingInfo served_by = 4;
+}
+
+message DropRequest {
+  string student_id = 1;
+  string section_id = 2;
+}
+
+message DropResponse {
+  bool committed = 1;
+  uint32 enrolled_count = 2;
+  uint32 capacity = 3;
+  repeated RoutingInfo served_by = 4;
+}
+
+message GetStudentScheduleRequest {
+  string student_id = 1;
+}
+
+message GetStudentScheduleResponse {
+  repeated string section_ids = 1;
+  repeated RoutingInfo served_by = 2;
+}
+
+message GetSectionRosterRequest {
+  string section_id = 1;
+}
+
+message GetSectionRosterResponse {
+  repeated string student_ids = 1;
+  uint32 capacity = 2;
+  repeated RoutingInfo served_by = 3;
+}
+
+message CreateAccountRequest {
+  string account_id = 1;
+  int64 initial_balance_cents = 2;
+}
+
+message CreateAccountResponse {
+  string account_id = 1;
+  int64 balance_cents = 2;
+  RoutingInfo routing = 3;
+}
+
+message GetAccountRequest {
+  string account_id = 1;
+}
+
+message GetAccountResponse {
+  string account_id = 1;
+  int64 balance_cents = 2;
+  RoutingInfo routing = 3;
+}
+
+message TransferRequest {
+  string from_account_id = 1;
+  string to_account_id = 2;
+  int64 amount_cents = 3;
+}
+
+message TransferResponse {
+  bool committed = 1;
+  int64 from_balance_cents = 2;
+  int64 to_balance_cents = 3;
+  repeated RoutingInfo served_by = 4;
+}
+
+message CreateInventoryItemRequest {
+  string item_id = 1;
+  uint32 quantity = 2;
+}
+
+message CreateInventoryItemResponse {
+  string item_id = 1;
+  uint32 quantity = 2;
+  RoutingInfo routing = 3;
+}
+
+message ReserveItemRequest {
+  string item_id = 1;
+  string reservation_id = 2;
+  uint32 quantity = 3;
+}
+
+message ReserveItemResponse {
+  bool committed = 1;
+  uint32 remaining_quantity = 2;
+  repeated RoutingInfo served_by = 3;
+}
+
+message ReleaseReservationRequest {
+  string item_id = 1;
+  string reservation_id = 2;
+}
+
+message ReleaseReservationResponse {
+  bool committed = 1;
+  uint32 remaining_quantity = 2;
+  repeated RoutingInfo served_by = 3;
+}
+
+message GetInventoryRequest {
+  string item_id = 1;
+}
+
+message GetInventoryResponse {
+  string item_id = 1;
+  uint32 total_quantity = 2;
+  uint32 reserved_quantity = 3;
+  uint32 available_quantity = 4;
+  repeated RoutingInfo served_by = 5;
+}

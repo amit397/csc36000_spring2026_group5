@@ -1,0 +1,36 @@
+syntax = "proto3";
+package week09admin;
+
+service ClusterAdmin {
+  rpc Rebalance(RebalanceRequest) returns (RebalanceResponse);
+  rpc GetClusterState(GetClusterStateRequest) returns (GetClusterStateResponse);
+}
+
+message GetClusterStateRequest {}
+
+message RebalanceRequest {
+  string reason = 1;
+}
+
+message RebalanceResponse {
+  uint32 moved_shards = 1;
+  repeated string notes = 2;
+}
+
+message ShardNodeState {
+  int32 node_id = 1;
+  string addr = 2;
+  repeated int32 logical_shard_ids = 3;
+  uint64 total_records = 4;
+}
+
+message LogicalShardState {
+  int32 logical_shard_id = 1;
+  int32 owner_node_id = 2;
+  uint64 record_count = 3;
+}
+
+message GetClusterStateResponse {
+  repeated ShardNodeState nodes = 1;
+  repeated LogicalShardState logical_shards = 2;
+}
