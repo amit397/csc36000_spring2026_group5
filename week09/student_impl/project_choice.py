@@ -119,6 +119,6 @@ class IsolationTradeoff(str, Enum):
 # the tests compare them against behavior, and your student_impl/README.md
 # should explain why the declarations are appropriate.
 
-SELECTED_APPLICATION = ApplicationChoice.COURSE_REGISTRATION
+SELECTED_APPLICATION = ApplicationChoice.INVENTORY
 SELECTED_SHARDING_TRADEOFF = ShardingTradeoff.HASH_DISTRIBUTED
 SELECTED_ISOLATION_TRADEOFF = IsolationTradeoff.SERIALIZABLE_LIKE

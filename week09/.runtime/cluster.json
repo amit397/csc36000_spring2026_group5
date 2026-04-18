@@ -1,0 +1,61 @@
+{
+  "gateway": {
+    "addr": "127.0.0.1:50151",
+    "pid": 10424
+  },
+  "admin": {
+    "addr": "127.0.0.1:50151",
+    "pid": 10424
+  },
+  "shard_nodes": [
+    {
+      "id": 1,
+      "addr": "127.0.0.1:50161",
+      "pid": 23172
+    },
+    {
+      "id": 2,
+      "addr": "127.0.0.1:50162",
+      "pid": 9940
+    },
+    {
+      "id": 3,
+      "addr": "127.0.0.1:50163",
+      "pid": 6932
+    }
+  ],
+  "logical_shards": [
+    {
+      "logical_shard_id": 0,
+      "owner_node_id": 1
+    },
+    {
+      "logical_shard_id": 1,
+      "owner_node_id": 1
+    },
+    {
+      "logical_shard_id": 2,
+      "owner_node_id": 1
+    },
+    {
+      "logical_shard_id": 3,
+      "owner_node_id": 1
+    },
+    {
+      "logical_shard_id": 4,
+      "owner_node_id": 1
+    },
+    {
+      "logical_shard_id": 5,
+      "owner_node_id": 2
+    },
+    {
+      "logical_shard_id": 6,
+      "owner_node_id": 2
+    },
+    {
+      "logical_shard_id": 7,
+      "owner_node_id": 3
+    }
+  ]
+}

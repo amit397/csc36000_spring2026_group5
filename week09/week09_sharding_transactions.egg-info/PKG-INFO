@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: week09-sharding-transactions
+Version: 0.1.0
+Summary: Week 09 starter for sharding and transactions
+Requires-Dist: grpcio>=1.60.0
+Requires-Dist: protobuf>=4.25.0
+Dynamic: requires-dist
+Dynamic: summary

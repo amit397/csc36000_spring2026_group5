@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -53,20 +54,49 @@ def cluster_ports(cluster_data: ClusterState) -> list[int]:
 
 def best_effort_stop_listening_ports(port_numbers: list[int]) -> None:
     discovered_pids: set[int] = set()
-    for port_number in port_numbers:
+    lsof_executable = shutil.which("lsof")
+    if lsof_executable:
+        for port_number in port_numbers:
+            proc = subprocess.run(
+                [lsof_executable, "-t", f"-iTCP:{port_number}", "-sTCP:LISTEN"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if proc.returncode not in (0, 1):
+                continue
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    discovered_pids.add(int(line))
+    else:
+        # Windows fallback: parse `netstat -ano -p tcp` for LISTENING entries.
         proc = subprocess.run(
-            ["lsof", "-t", f"-iTCP:{port_number}", "-sTCP:LISTEN"],
+            ["netstat", "-ano", "-p", "tcp"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
         )
-        if proc.returncode not in (0, 1):
-            continue
-        for line in proc.stdout.splitlines():
-            line = line.strip()
-            if line.isdigit():
-                discovered_pids.add(int(line))
+        if proc.returncode == 0:
+            tracked_ports = set(port_numbers)
+            for line in proc.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                state = parts[3].upper()
+                if state != "LISTENING":
+                    continue
+                local_addr = parts[1]
+                if ":" not in local_addr:
+                    continue
+                raw_port = local_addr.rsplit(":", 1)[1]
+                if not raw_port.isdigit() or int(raw_port) not in tracked_ports:
+                    continue
+                pid = parts[4]
+                if pid.isdigit():
+                    discovered_pids.add(int(pid))
     for pid in sorted(discovered_pids):
         best_effort_stop_pid(pid)
 
