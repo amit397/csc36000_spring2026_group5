@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 from concurrent import futures
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,16 @@ class StudentShardStoreAdapter:
         self.node_id = node_id
         self.data_dir = node_data_dir(node_id)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._shard_locks_mutex = threading.Lock()
+        self._shard_locks: dict[int, threading.Lock] = {}
+
+    def _lock_for(self, logical_shard_id: int) -> threading.Lock:
+        with self._shard_locks_mutex:
+            lock = self._shard_locks.get(logical_shard_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._shard_locks[logical_shard_id] = lock
+            return lock
 
     def _storage_path(self, logical_shard_id: int) -> Path:
         return self.data_dir / f"logical_shard_{logical_shard_id}.json"
@@ -41,27 +52,32 @@ class StudentShardStoreAdapter:
         student_storage.save_logical_shard_state(self._storage_path(logical_shard_id), state)
 
     def apply(self, logical_shard_id: int, operation_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        state = self._load_state(logical_shard_id)
-        result = student_transactions.apply_local_mutation(state, operation_name, payload)
-        self._save_state(logical_shard_id, state)
-        return result
+        with self._lock_for(logical_shard_id):
+            state = self._load_state(logical_shard_id)
+            result = student_transactions.apply_local_mutation(state, operation_name, payload)
+            self._save_state(logical_shard_id, state)
+            return result
 
     def read(self, logical_shard_id: int, query_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        state = self._load_state(logical_shard_id)
-        return student_transactions.run_local_query(state, query_name, payload)
+        with self._lock_for(logical_shard_id):
+            state = self._load_state(logical_shard_id)
+            return student_transactions.run_local_query(state, query_name, payload)
 
     def dump(self, logical_shard_id: int) -> dict[str, Any]:
-        state = self._load_state(logical_shard_id)
-        return student_storage.export_logical_shard_state(state)
+        with self._lock_for(logical_shard_id):
+            state = self._load_state(logical_shard_id)
+            return student_storage.export_logical_shard_state(state)
 
     def load_dump(self, logical_shard_id: int, dump_data: dict[str, Any]) -> None:
-        state = student_storage.import_logical_shard_state(dump_data)
-        self._save_state(logical_shard_id, state)
+        with self._lock_for(logical_shard_id):
+            state = student_storage.import_logical_shard_state(dump_data)
+            self._save_state(logical_shard_id, state)
 
     def drop(self, logical_shard_id: int) -> None:
-        storage_path = self._storage_path(logical_shard_id)
-        if storage_path.exists():
-            storage_path.unlink()
+        with self._lock_for(logical_shard_id):
+            storage_path = self._storage_path(logical_shard_id)
+            if storage_path.exists():
+                storage_path.unlink()
 
     def status(self) -> list[tuple[int, int]]:
         record_counts_by_shard: dict[int, int] = {}
