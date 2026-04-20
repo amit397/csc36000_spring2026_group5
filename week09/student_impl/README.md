@@ -71,6 +71,25 @@ There is no separate recovery phase. On restart, `run_cluster.py` relaunches eac
 ### Transaction recovery
 Every inventory operation is single-shard and single-step: one load, one in-memory mutation, one atomic save. There is no multi-step commit protocol, so there is no in-flight transaction state to roll forward or back. The atomic-rename guarantee of `save_logical_shard_state` is what makes transaction recovery trivial for this application: the shard file on disk is always a consistent snapshot of some serial order of committed mutations, and that is exactly the state we reload on restart.
 
+### Atomicity under failures
+
+Our system guarantees atomicity despite crashes by ensuring that every mutation is applied as a single atomic state transition at the storage layer.
+
+Each operation follows a strict pattern:
+
+1. Load the current shard state from disk
+2. Apply the mutation in memory
+3. Persist the entire updated state using an atomic file replacement
+
+Because `save_logical_shard_state` writes to a temporary file and then atomically replaces the original file using `os.replace`, the system guarantees that after any crash, the shard is in exactly one of two states:
+
+- The full effect of the transaction is present
+- None of the transaction is present
+
+There is no possible state where a transaction is partially applied.
+
+This property directly enforces atomicity without requiring a separate write-ahead log or undo/redo mechanism, because each transaction is a single-step transformation of the shard state.
+
 ### What gets written before ack
 Only the post-mutation shard state, through `save_logical_shard_state`. No write-ahead log, no per-transaction undo/redo record — the single-shard + single-step design does not need one.
 
