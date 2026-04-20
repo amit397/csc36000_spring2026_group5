@@ -64,17 +64,39 @@ def _inventory(state: dict[str, Any]) -> dict[str, Any]:
 
 def apply_local_mutation(state: dict[str, Any], operation_name: str, payload: dict[str, Any]) -> dict[str, Any]:
     """
-    Apply a single-shard mutation to local shard state and return a
-    JSON-serializable result.
+    Apply a single-shard mutation with idempotency and recovery tracking.
     """
-    if operation_name == "create_item":
-        return _create_item(state, payload)
-    if operation_name == "reserve_item":
-        return _reserve_item(state, payload)
-    if operation_name == "release_reservation":
-        return _release_reservation(state, payload)
 
-    raise ValueError(f"Unknown mutation: {operation_name!r}")
+    txns = _transactions(state)
+
+    # Use reservation_id as txn_id when available (best choice)
+    txn_id = payload.get("reservation_id")
+
+    if txn_id is None:
+        # fallback (create_item doesn't have reservation_id)
+        txn_id = f"{operation_name}:{payload.get('item_id')}"
+
+    # Idempotency check
+    if txn_id in txns:
+        return txns[txn_id]["result"]
+
+    # Execute mutation
+    if operation_name == "create_item":
+        result = _create_item(state, payload)
+    elif operation_name == "reserve_item":
+        result = _reserve_item(state, payload)
+    elif operation_name == "release_reservation":
+        result = _release_reservation(state, payload)
+    else:
+        raise ValueError(f"Unknown mutation: {operation_name!r}")
+
+    # Record commit BEFORE returning
+    txns[txn_id] = {
+        "status": "COMMITTED",
+        "result": result,
+    }
+
+    return result
 
 
 def _create_item(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
