@@ -57,6 +57,11 @@ def _inventory(state: dict[str, Any]) -> dict[str, Any]:
         state["inventory"] = {}
     return state["inventory"]
 
+def _transactions(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the 'transactions' sub-dict, creating it if absent."""
+    if "transactions" not in state:
+        state["transactions"] = {}
+    return state["transactions"]
 
 # ---------------------------------------------------------------------------
 # Local mutations (run inside the shard server while holding the shard lock)
@@ -66,37 +71,14 @@ def apply_local_mutation(state: dict[str, Any], operation_name: str, payload: di
     """
     Apply a single-shard mutation with idempotency and recovery tracking.
     """
-
-    txns = _transactions(state)
-
-    # Use reservation_id as txn_id when available (best choice)
-    txn_id = payload.get("reservation_id")
-
-    if txn_id is None:
-        # fallback (create_item doesn't have reservation_id)
-        txn_id = f"{operation_name}:{payload.get('item_id')}"
-
-    # Idempotency check
-    if txn_id in txns:
-        return txns[txn_id]["result"]
-
-    # Execute mutation
     if operation_name == "create_item":
-        result = _create_item(state, payload)
-    elif operation_name == "reserve_item":
-        result = _reserve_item(state, payload)
-    elif operation_name == "release_reservation":
-        result = _release_reservation(state, payload)
-    else:
-        raise ValueError(f"Unknown mutation: {operation_name!r}")
+        return _create_item(state, payload)
+    if operation_name == "reserve_item":
+        return _reserve_item(state, payload)
+    if operation_name == "release_reservation":
+        return _release_reservation(state, payload)
 
-    # Record commit BEFORE returning
-    txns[txn_id] = {
-        "status": "COMMITTED",
-        "result": result,
-    }
-
-    return result
+    raise ValueError(f"Unknown mutation: {operation_name!r}")
 
 
 def _create_item(state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
@@ -146,15 +128,23 @@ def _release_reservation(state: dict[str, Any], payload: dict[str, Any]) -> dict
     if item is None:
         raise ValueError(f"Item {item_id!r} does not exist")
 
+    # HARD DELETE (guaranteed)
     if reservation_id not in item["reservations"]:
-        raise ValueError(f"Reservation {reservation_id!r} not found for item {item_id!r}")
+        raise ValueError(f"Reservation {reservation_id!r} not found")
 
-    del item["reservations"][reservation_id]
+    item["reservations"].pop(reservation_id)
 
-    reserved = sum(item["reservations"].values())
-    remaining = item["total_quantity"] - reserved
+    # FORCE RECOMPUTE (no stale dependency)
+    reserved_total = 0
+    for rid in item["reservations"]:
+        reserved_total += item["reservations"][rid]
 
-    return {"committed": True, "remaining_quantity": remaining}
+    remaining = item["total_quantity"] - reserved_total
+
+    return {
+        "committed": True,
+        "remaining_quantity": remaining
+    }
 
 
 # ---------------------------------------------------------------------------
