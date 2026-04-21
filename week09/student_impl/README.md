@@ -30,7 +30,7 @@ With many different item_id values, a good hash function spreads outputs pseudo-
 This is also deterministic: same partition key always maps to same logical shard, which is essential for routing consistency.
 
 `Transactions:`
-Transactions are single shard sicne all operations are keyed by item_id so this means that every operation hits excactly one shard.
+Transactions are single shard since all operations are keyed by item_id so this means that every operation hits excactly one shard.
 The declared isolation tradeoff is that the transactions are serializable, so that means that the operarations behave as if they were executed in serial.
 
 ## Durable local storage
