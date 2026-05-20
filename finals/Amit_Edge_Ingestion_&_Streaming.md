@@ -1,4 +1,6 @@
 Amit Howlader  
+
+Docs Link: https://docs.google.com/document/d/1XfjaAJYn8HfatquD99HUQ3JfPlwyS22UiVb3lBF6le0/edit?usp=sharing
 Edge Ingestion & Streaming
 
 **Architectural Design**:  
