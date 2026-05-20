@@ -9,7 +9,7 @@ The worker node system responsible for pairing riders and drivers acts as the cr
 
 To achieve sub-second matching, the architecture deploys a cluster of distributed Matchmaking Workers. These workers are stateful consumers that subscribe to two Apache Kafka topics: the `rider-requests` topic and the derived `driver-locations-by-cell` topic. As established in the edge ingestion pipeline, raw driver GPS pings land in the `driver-pings` topic partitioned by `hash(driver_id)` (which preserves per-driver trajectory order and gives even broker load), and an upstream Apache Flink job re-keys them into `driver-locations-by-cell`, partitioned by Uber's H3 geospatial hexagon cells at Resolution 9 (~0.1 km² cells). The Matchmaking Worker cluster is one of the six independent Kafka consumer groups that read off the ingestion pipeline; the analytics, ML, audit, surge-pricing, and notification pipelines are the other five, each consuming at their own pace via independent offsets.
 
-Because the ingestion service already deduplicates pings on `(driver_id, sequence_number)`, the matchmaker treats each consumed location event as unique and performs no ping-level idempotency check of its own. Dispatch-level idempotency (a duplicate retry of "assign Driver X to Rider Y") is a separate concern, enforced by the `(trip_id, fencing_token)` pair on the CockroachDB write as described in Section 2.
+Because the ingestion service already deduplicates pings on `(driver_id, sequence_number)`, the matchmaker treats each consumed location event as unique and performs no ping-level idempotency check of its own. Dispatch-level idempotency (a duplicate retry of "assign Driver X to Rider Y") is a separate concern: every dispatch carries an `event_id` matching Hurera's `UNIQUE(trip_id, event_id)` constraint on `trip_state_transitions`, so a retried dispatch — e.g. after a Kafka consumer-group rebalance forces the same rider request to be re-read — cannot re-apply the same state transition twice. The fencing mechanism in Section 2 handles the orthogonal zombie-leader case.
 
 ```text
 [Driver phones] --gRPC--> [Envoy + Ingestion svc] --> [Kafka: driver-pings]
@@ -84,89 +84,117 @@ To minimize the window in which a zombie can do damage, leadership is managed vi
 
 ### Fencing Tokens & Downstream Enforcement via CockroachDB
 
-Because local clocks can still drift or pause, leases alone cannot mathematically guarantee safety at the storage layer—a frozen worker may simply not realize its lease has expired. To completely neutralize zombie leaders, the system enforces **fencing tokens**, leveraging CockroachDB's strictly serializable transactions and Multiversion Concurrency Control (MVCC).
+Because local clocks can still drift or pause, leases alone cannot mathematically guarantee safety at the storage layer—a frozen worker may simply not realize its lease has expired. To completely neutralize zombie leaders, the matchmaker adds a **`fencing_token` column** to Hurera's `trips` schema and enforces a monotonic-token check on every dispatch write, leveraging CockroachDB's strictly serializable transactions and Multiversion Concurrency Control (MVCC).
+
+**Two distinct tokens, kept deliberately separate.** It is tempting to say "the ZK sequence number *is* the fencing token", but doing so conflates two values that live in two systems with different failure modes. They are kept apart in this design:
+
+- **ZK leader token** — an ephemeral-sequential sequence number generated inside ZooKeeper at election time (e.g. Worker A's `lock-0000000100`, Worker B's `lock-0000000101`). It exists only in ZK and is what the consensus layer uses to *order leaders*. CockroachDB never sees it; ZooKeeper never sees the database.
+- **`trips.fencing_token`** — a column the matchmaker adds to Hurera's `trips` schema, holding the largest leader-token that has ever successfully written this row. The DB column has its own MVCC lifecycle; ZK has no opinion on it.
+
+The two are bridged only by the worker, which carries its current ZK leader token into each dispatch as a *value* and writes that value into `trips.fencing_token`. ZK can be unreachable without invalidating tokens already stored on rows, and the database can be queried without involving ZK. Keeping the two artifacts in separate failure domains is what lets each layer fail closed independently.
 
 ```text
-ZooKeeper (Lease / Token Generator)
-  |-- Grants lock to Worker A  -> Token = 100      [Worker A then freezes]
-  |-- Session expires          -> Grants lock to Worker B  -> Token = 101
+ZooKeeper                                  CockroachDB (trips.fencing_token)
+  |-- Worker A elected (ZK token 100)         [stored = 0 on fresh trip rows]
+  |-- Worker A freezes
+  |-- Session expires → Worker B elected
+       (ZK token 101)                         [unchanged: still 0]
   v
-Worker B (Active Leader)
-  |-- Sends dispatch (Driver X -> Rider Y) to CockroachDB with token 101
+Worker B (Active Leader, carries ZK token 101)
+  |-- UPDATE trips
+        SET ..., fencing_token = 101
+        WHERE trip_id = Y AND fencing_token <= 101;
   v
-CockroachDB [Trip Database]
-  |-- Executes UPDATE. Records driver X state = 'busy', fencing_token = 101.
+CockroachDB
+  |-- Predicate (stored=0 <= 101) holds; 1 row affected.
+  |-- trips.fencing_token now = 101.
   v
-Worker A (Zombie Leader Wakes Up)
-  |-- Attempts stale dispatch tagged with token 100
+Worker A (Zombie, still carries old ZK token 100)
+  |-- UPDATE trips
+        SET ..., fencing_token = 100
+        WHERE trip_id = Y AND fencing_token <= 100;
   v
-CockroachDB [Trip Database]
-  |-- FENCE ENFORCED: predicate (stored_token <= 100) fails because stored_token = 101.
+CockroachDB
+  |-- FENCE ENFORCED: stored (101) <= 100 is false; 0 rows affected.
+  |-- Worker treats the zero-row result as a fence rejection and aborts.
 ```
 
-When ZooKeeper elects a leader via an ephemeral-sequential znode, the generated sequence number serves as a natural, monotonically increasing fencing token. Worker A is elected with token 100; when it freezes and Worker B takes over, Worker B is assigned token 101. We deliberately reuse the ZK sequence number rather than introducing a parallel counter, so there is exactly one source of truth for leadership order.
+To enforce the fence downstream, every dispatch commit carries the worker's current ZK leader token into the predicate:
 
-To enforce the fence downstream, every dispatch commit from a Matchmaking Worker carries its token, and CockroachDB rejects writes from stale leaders:
-
-1. When Worker B finalizes a match, it executes a transactional `UPDATE` on the driver and trip rows, setting `fencing_token = 101` only if the currently stored token is `<= 101`. Because CockroachDB uses serializable isolation, this commit is atomic.
-2. When the zombie Worker A wakes up and submits its stale write, it issues something equivalent to:
+1. When Worker B finalizes a match, it executes a transactional `UPDATE` on the trip row, setting `fencing_token = 101` only if the currently stored token is `<= 101`. CockroachDB's serializable isolation makes the comparison and the write one atomic step.
+2. When the zombie Worker A wakes up and submits its stale dispatch, it issues something equivalent to:
    ```sql
-   UPDATE driver_state
-   SET    status = 'busy', trip_id = Y, fencing_token = 100
-   WHERE  driver_id = X AND fencing_token <= 100;
+   UPDATE trips
+   SET    driver_id = X, current_state = 'ASSIGNED', fencing_token = 100
+   WHERE  trip_id = Y AND fencing_token <= 100;
    ```
-3. CockroachDB evaluates the predicate. Because Worker B has already advanced the stored token to 101, `101 <= 100` is false; the update affects zero rows and the transaction is effectively a no-op (the worker treats "zero rows affected" as a fence rejection and aborts).
+3. Because Worker B has already advanced the stored token to 101, the predicate `101 <= 100` is false; the update affects zero rows and the transaction is effectively a no-op (the worker treats "zero rows affected" as a fence rejection and aborts).
 
-The predicate uses `<=` rather than strict `<` so that a current leader can issue multiple updates within its own lease: after its first commit the stored token equals its own token, and strict `<` would reject every subsequent write from that same leader. With `<=`, the active leader's writes succeed and any older leader's writes (carrying a strictly smaller token) are rejected.
+The predicate uses `<=` rather than strict `<` so that a current leader can issue multiple updates within its own lease: after its first commit the stored token equals its own token, and strict `<` would reject every subsequent write from that same leader. With `<=`, the active leader's writes succeed (stored equals my token) and any older leader's writes (carrying a strictly smaller token) are rejected. The `<=` form also handles bootstrap cleanly: a new leader's first write succeeds against a row whose stored token came from an older leader, because that older value is strictly smaller than the new leader's own.
+
+**Cross-row safety net via Hurera's partial unique index.** Per-row fencing closes the *same-trip* race — A and B both racing to dispatch the same rider request. It does *not* directly close the *cross-trip* race in which the zombie and the active leader pick the same driver but write to different `trip_id` rows, so each row's `fencing_token` check passes on its own. That residual case is closed by Hurera's partial unique index `one_active_trip_per_driver ON trips(driver_id) WHERE current_state IN (ASSIGNED, EN_ROUTE, IN_PROGRESS)`: only one of the two writes can persist that driver in an active state, and the second fails with a unique-index violation. Section 3 returns to this index when discussing hotspots, where its physical layout becomes the relevant contention surface.
 
 ## 3. Sharding & Hotspots: Partitioning the Active Driver Pool
 
-The durable driver and trip state must be partitioned across many physical nodes to handle millions of writes per second. In this section, "active driver pool" refers to the durable projection of driver state in CockroachDB—status, current trip, last known cell, and fencing token—not the ephemeral in-memory R-Tree maintained by each matchmaking worker. The R-Trees are a hot cache rebuilt from Kafka; CockroachDB remains the system of record. Partitioning of this durable state relies on CockroachDB's distributed, range-based architecture.
+The durable trip state must be partitioned across many physical nodes to handle millions of writes per second. In this section, **"active driver pool" is not a separate table** — it is the derived projection of Hurera's `trips` table defined by the partial unique index `one_active_trip_per_driver ON trips(driver_id) WHERE current_state IN (ASSIGNED, EN_ROUTE, IN_PROGRESS)`. That single constraint is what lets the matchmaker treat "the set of drivers currently on a trip" as a first-class concept without introducing a parallel store: the index *is* the pool, and the same index is also the cross-row guarantee against double-booking from Section 2. The ephemeral in-memory R-Tree maintained by each matchmaking worker is a hot cache rebuilt from Kafka; CockroachDB remains the system of record.
 
 ### Partitioning Strategy via CockroachDB Ranges
 
 Under the hood, CockroachDB stores all data in a single sorted key-value map. To distribute data across physical nodes, it divides this map into contiguous chunks called **ranges** (default ~512 MiB). Each range is an independent Raft consensus group replicated across multiple database nodes.
 
-To match our geospatial matchmaking pattern, the driver-pool and trip tables are partitioned by geographic location, using the H3 cell index as the primary-key prefix:
+Hurera's schema fixes the partitioning choices for us. The `trips` primary key is `trip_id` (UUID) and the table is **geo-partitioned by region** so each region's rows are domiciled and Raft-replicated locally (Trip State Machine doc §1.3). Two consequences fall out for the matchmaker:
 
 ```sql
-PRIMARY KEY (h3_cell_id, driver_id)
+-- Hurera's trips schema (relevant excerpt)
+PRIMARY KEY (trip_id)                                       -- UUID, naturally well-distributed
+PARTITION BY LIST (region)                                  -- regional geo-partitioning
+UNIQUE INDEX one_active_trip_per_driver
+    ON trips (driver_id)
+    WHERE current_state IN ('ASSIGNED', 'EN_ROUTE', 'IN_PROGRESS')
 ```
 
-Partitioning purely by `driver_id` would scatter drivers randomly across ranges, leading to expensive cross-node fan-out when auditing a specific geographic zone. Prefixing the primary key with `h3_cell_id` causes CockroachDB to naturally group all drivers within the same vicinity onto the same physical range, localizing reads and dispatch writes for a given zone.
+1. **Within a region, dispatch writes scatter naturally.** Because `trip_id` is a UUID, two simultaneous `REQUESTED → ASSIGNED` updates almost never land on the same range — there is no key-prefix concentration to fight. The same holds for inserts of new `REQUESTED` rows. This is the same distribution argument that justified `hash(driver_id)` partitioning on the Kafka `driver-pings` topic in Section 1, applied at the storage layer.
+2. **Spatial locality is provided by the R-Tree, not the database.** Because matchmaking never issues a spatial query against `trips` on the hot path — the worker queries its local R-Tree — we do not need the database PK to encode geography. The H3-cell layout lives in the Kafka topic (`driver-locations-by-cell`) and in the worker's R-Tree; the DB only sees the final dispatch write.
+
+So the partitioning story is: regional geo-partitioning gives data residency and intra-region replication latency, the UUID PK gives intra-region write distribution, and the partial unique index gives us the "active driver pool" view at zero schema cost.
 
 ### Handling Geographic Hotspots
 
-Geospatial co-location introduces a physical vulnerability: **geographic hotspots**. When a stadium empties after a championship game, tens of thousands of *rider requests* and the resulting dispatch writes (`trips` inserts and `driver_state` updates) concentrate within a small handful of H3 cells. Because CockroachDB orders data sequentially by primary key, all writes for that `h3_cell_id` flood a single range, overwhelming the leaseholder for that range while the rest of the cluster sits idle. (Driver location updates also concentrate, but those are absorbed mostly by the Kafka log; the database-side hotspot is dominated by dispatch.)
+Even with UUID-keyed `trip_id`, **geographic hotspots** can still bite the matchmaker in two ways:
+
+- **Time-localized write bursts.** When a stadium empties after a championship game, tens of thousands of rider requests and the resulting `REQUESTED` inserts plus `REQUESTED → ASSIGNED` updates concentrate in a few seconds. They are spread across many ranges by UUID, but the *aggregate* write rate on whichever ranges happen to receive them can still saturate their leaseholders.
+- **Per-driver index contention on `one_active_trip_per_driver`.** Each contested dispatch attempt against the same driver must touch the same index entry; under a hot-cell burst, many workers race for the small set of drivers physically present in that cell, all writing to nearby index keys.
 
 Two complementary mitigations are used, both relying on native CockroachDB features:
 
 ```text
 Baseline hotspot scenario:
-  [Single H3 Cell: Stadium]  === H3-prefixed PK ===>  [Single CockroachDB Range]  (overload!)
+  [Stadium burst]  === thousands of writes/sec ===>  [A handful of trips ranges]  (saturation)
 
 Mitigation 1: Load-Based Range Splitting
-  [Range covering hot cells]  ---> detects high QPS / CPU --->  dynamically splits range
-                                                                       |
-                                                                       ===> Raft rebalances halves to new nodes
+  [Hot range]  ---> detects high QPS / CPU --->  dynamically splits range
+                                                          |
+                                                          ===> Raft rebalances halves to new nodes
 
-Mitigation 2: Suffix-Based Salting / Hash-Sharded Indexes
-  PK = (h3_cell_id, driver_id % S, driver_id)  --->  S = 5  --->  5 distinct ranges, 5 leaseholders
+Mitigation 2: Hash-Sharded Index on the hot lookup
+  one_active_trip_per_driver  --->  hash-sharded (S buckets)
+  --->  S distinct index ranges, S leaseholders
 ```
 
 #### 1. Dynamic Load-Based Range Splitting
 
-CockroachDB monitors queries-per-second and CPU load on every range. If write load on a hot range breaches a threshold, CockroachDB triggers a **load-based split**, even if the range is well under its 512 MiB size limit. The cluster then rebalances the newly created ranges to different physical nodes via Raft, scattering the localized load without any application-level downtime or manual resharding.
+CockroachDB monitors queries-per-second and CPU load on every range. If write load on a hot `trips` range breaches a threshold, CockroachDB triggers a **load-based split**, even if the range is well under its 512 MiB size limit. The cluster then rebalances the newly created ranges to different physical nodes via Raft, scattering the localized load without any application-level downtime or manual resharding. Because Hurera's `trip_id` PK is a UUID, splits land on essentially arbitrary boundaries and never have to track a moving geographic key.
 
-#### 2. Suffix-Based Salting & Hash-Sharded Indexes
+#### 2. Hash-Sharded Indexes on the Contended Lookup Path
 
-If a hotspot is extreme enough that load-based splitting cannot keep up organically, the application enforces **deterministic salting**, either manually or via CockroachDB's native hash-sharded indexes:
+The partial unique index `one_active_trip_per_driver` can itself become a hotspot under a stadium-scale burst: although `driver_id` is a UUID, the *physically present* drivers in one H3 cell are a small set, so their index entries are nearby in the index key space and a handful of index ranges can carry most of the contention. CockroachDB's native `USING HASH WITH BUCKET_COUNT = S` clause splits the index across `S` shards:
 
 ```sql
-PRIMARY KEY (h3_cell_id, salt_bucket, driver_id)
--- where salt_bucket = driver_id % S
+UNIQUE INDEX one_active_trip_per_driver
+    ON trips (driver_id) USING HASH WITH BUCKET_COUNT = 8
+    WHERE current_state IN ('ASSIGNED', 'EN_ROUTE', 'IN_PROGRESS')
 ```
 
-With a salt factor `S = 5`, driver-state updates for a single congested cell are distributed across five distinct key prefixes and therefore across five independent ranges with five different leaseholders. Reads that need the full picture of a cell now require a bounded scatter-gather across the five buckets.
+With eight buckets, contested writes against the same congested cell now hit eight independent index ranges with eight different leaseholders. Lookups by `driver_id` still touch only one bucket (the bucket is a deterministic function of `driver_id`), so the cross-row uniqueness guarantee from Section 2 — "this driver is not in another active trip" — is preserved.
 
-Salting is purely a write-side optimization and explicitly sacrifices the read-side locality that motivated prefixing the primary key with `h3_cell_id`: matchmaking and audit queries against a salted cell must now scatter-gather across `S` ranges instead of reading from one. Salting is therefore applied selectively, only to the small set of cells flagged as chronic hotspots (stadiums, airports, central business districts), so that the rare hot cells pay for parallelism while the common case retains its single-range read pattern.
+Hash-sharding the *index* rather than the *primary key* is the right knob here because the table itself is already well-distributed by UUID PK; only the index that joins on `driver_id` needs help. This applies selectively to the small set of indexes that show measurable contention, so the common case retains its single-bucket lookup pattern.
