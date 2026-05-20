@@ -48,7 +48,7 @@ The two PNGs (`state-machine.png` and `sequence diagram.png`) are referenced fro
 
 | # | Author | Section | File |
 |---|---|---|---|
-| 1 | Amit Howlander      | Edge Ingestion & Streaming | _coming soon_ |
+| 1 | Amit Howlander      | Edge Ingestion & Streaming | [Amit_Edge_Ingestion_&_Streaming.md](./Amit_Edge_Ingestion_&_Streaming.md) |
 | 2 | Muhammad Tufail     | Matchmaking Worker & Coordination | [Muhammad_Tufail_Matchmaking_Worker_&_Coordination.md](./Muhammad_Tufail_Matchmaking_Worker_&_Coordination.md)         |
 | 3 | Hurera Ranjha       | Trip State Machine & Distributed Transactions | [Hurera_Ranjha_Trip_State_Machine_&_Distributed_Transactions .md](./Hurera_Ranjha_Trip_State_Machine_&_Distributed_Transactions%20.md) |
 | 4 | Christopher Santana | Observability, Fault Tolerance, & Recovery | [Christopher_Santana_Fault_Tolerance_&_Recovery.md](./Christopher_Santana_Fault_Tolerance_&_Recovery.md) |
